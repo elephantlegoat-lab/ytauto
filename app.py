@@ -39,7 +39,8 @@ def active():
 def _env(k): return [x.strip() for x in os.environ.get(k, "").split("|") if x.strip()]
 def config(cid):
     c = {"titres": _env("TITRES"), "fixes": _env("HASHTAGS"), "pool": _env("HASHTAGS_TEST"),
-         "par_video": 8, "heures": [12, 18, 20], "apprentissage": True}
+         "par_video": 8, "heures": [12, 18, 20], "apprentissage": True,
+         "desc": "ASMR relaxant pour dormir et se détendre"}
     c.update((charger(cid) or {}).get("config", {}))
     return c
 
@@ -205,7 +206,7 @@ def upload():
     cid = active()
     if not cid: return redirect("/connect")
     yt, cfg = yt_for(cid), config(cid)
-    desc = request.form.get("desc", "").strip()
+    desc = request.form.get("desc", "").strip() or cfg["desc"]
     titre, tags, when, appr = choisir(historique(yt), cfg)
     titre = request.form.get("title", "").strip() or titre or titre_ia(desc)
     texte = desc + ("\n\n" + " ".join(tags) if tags else "") + ("\n#Shorts" if request.form.get("short") else "")
@@ -236,7 +237,12 @@ def cal():
     sem = calendar.Calendar().monthdatescalendar(a, mo)
     prec = (datetime(a, mo, 1) - timedelta(days=1)).strftime("%Y-%m")
     suiv = (datetime(a, mo, 28) + timedelta(days=5)).strftime("%Y-%m")
-    return vue("cal", sem=sem, jours=jours, mois=m, mo=mo, prec=prec, suiv=suiv, now=datetime.now(timezone.utc))
+    now = datetime.now(timezone.utc)
+    mois_fr = ["Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"]
+    agenda = {d.isoformat(): [dict(t=v["titre"], h=v["pub"].astimezone(TZ).strftime("%Hh%M"),
+              s="Publiée" if v["pub"] < now else "Programmée", v=v["vues"]) for v in l] for d, l in jours.items()}
+    return vue("cal", sem=sem, jours=jours, mois=m, mo=mo, prec=prec, suiv=suiv, now=now,
+               titre_mois=f"{mois_fr[mo-1]} {a}", today=datetime.now(TZ).date(), agenda=agenda)
 
 @app.route("/bibliotheque")
 @authed
@@ -271,7 +277,8 @@ def reglages():
                        "fixes": sp(f["fixes"]), "pool": sp(f["pool"]),
                        "par_video": int(f.get("par_video") or 8),
                        "heures": [int(x) for x in sp(f["heures"]) if x.isdigit() and int(x) < 24] or [18],
-                       "apprentissage": bool(f.get("apprentissage"))}
+                       "apprentissage": bool(f.get("apprentissage")),
+                       "desc": f.get("desc", "").strip() or "ASMR relaxant"}
         sauver(cid, d)
         return redirect("/reglages?msg=Réglages enregistrés.")
     return vue("reglages", c=config(cid))
@@ -279,47 +286,89 @@ def reglages():
 PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Programmateur YouTube</title><style>
-:root{--bg:#f3efe6;--ink:#1d1b18;--mut:#6b655b;--line:#cfc7b8;--acc:#1f4d3a;--card:#fbf8f1}
-@media(prefers-color-scheme:dark){:root{--bg:#16181a;--ink:#ece8df;--mut:#97928a;--line:#34383b;--acc:#7fd1a6;--card:#1d2023}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.5 Georgia,serif;
-padding:max(20px,env(safe-area-inset-top)) 18px max(24px,env(safe-area-inset-bottom))}
-main{max-width:760px;margin:0 auto}h1{font-size:1.8rem;line-height:1.15;margin:.6em 0 .3em}h2{font-size:1.15rem;margin:1.4em 0 .4em}
-p{color:var(--mut);margin:.2em 0 1em}label{display:block;font-weight:bold;margin:1.1em 0 .4em}
-input,textarea,select{width:100%;font:inherit;padding:13px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
-textarea{min-height:110px}.chk{display:flex;gap:10px;align-items:center;font-weight:normal}.chk input{width:22px;height:22px}
-button,.btn{display:inline-block;width:100%;margin-top:1.4em;padding:15px;font:inherit;font-weight:bold;background:var(--acc);color:var(--bg);border:0;border-radius:10px;text-align:center;text-decoration:none}
-nav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}nav a{padding:8px 13px;border:1px solid var(--line);border-radius:20px;color:var(--ink);text-decoration:none;font-size:.95rem}
-nav a.on{background:var(--acc);color:var(--bg);border-color:var(--acc)}
-.msg{background:var(--card);border-left:4px solid var(--acc);padding:12px 14px;margin:1em 0}.err{color:#b3261e}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}.v{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:.9rem}
-.v img{width:100%;display:block}.v div{padding:8px 10px}.mut{color:var(--mut)}
-table{width:100%;border-collapse:collapse;font-size:.85rem}td,th{border:1px solid var(--line);padding:5px;vertical-align:top;text-align:left}
-td.p{background:var(--card)}.pub{color:var(--acc)}.prog{color:#b36b00}.st td{font-size:.95rem}
+:root{--ink:#1c1c1e;--mut:#6e6e73;--glass:rgba(255,255,255,.5);--edge:rgba(255,255,255,.8);--line:rgba(60,60,67,.16);
+--acc:#0a84ff;--tint:rgba(10,132,255,.2);--pub:rgba(52,199,89,.3);--prog:rgba(255,159,10,.34);--red:#ff3b30;
+--bg:linear-gradient(160deg,#d6e4ff,#f1e6ff 55%,#ffe6dc)}
+@media(prefers-color-scheme:dark){:root{--ink:#f5f5f7;--mut:#a1a1a6;--glass:rgba(255,255,255,.08);--edge:rgba(255,255,255,.16);
+--line:rgba(255,255,255,.12);--acc:#64b5ff;--tint:rgba(100,181,255,.22);--pub:rgba(48,209,88,.32);--prog:rgba(255,159,10,.36);
+--bg:linear-gradient(160deg,#0a0f1f,#1a1033 55%,#2b1222)}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{background:var(--bg) fixed;scroll-behavior:smooth}
+body{margin:0;min-height:100vh;color:var(--ink);font:16px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif;
+padding:max(14px,env(safe-area-inset-top)) 16px max(28px,env(safe-area-inset-bottom));-webkit-font-smoothing:antialiased}
+main{max-width:860px;margin:0 auto}
+h1{font-size:1.9rem;font-weight:700;letter-spacing:-.02em;line-height:1.15;margin:.5em 0 .25em}
+h2{font-size:1.05rem;font-weight:600;margin:1.5em 0 .5em}p{color:var(--mut);margin:.2em 0 1em}a{color:var(--acc);text-decoration:none}
+label{display:block;font-weight:600;font-size:.92rem;margin:1.2em 0 .45em}
+.g,input,textarea,button,.btn,nav a,.v,.msg,table,.cal{background:var(--glass);-webkit-backdrop-filter:blur(26px) saturate(1.8);backdrop-filter:blur(26px) saturate(1.8);
+border:1px solid var(--edge);box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 8px 28px rgba(0,0,0,.07)}
+input,textarea{width:100%;font:inherit;color:var(--ink);padding:13px 15px;border-radius:14px;outline:0;transition:box-shadow .2s,border-color .2s}
+input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--tint)}textarea{min-height:90px;resize:vertical}
+button,.btn{display:block;width:100%;margin-top:1.4em;padding:15px;font:inherit;font-weight:600;color:var(--acc);background:var(--tint);
+border-radius:16px;text-align:center;cursor:pointer;transition:transform .18s cubic-bezier(.2,.8,.2,1),filter .2s}
+button:active,.btn:active,nav a:active{transform:scale(.96)}button:disabled{opacity:.55}
+nav{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}nav a{padding:8px 15px;border-radius:999px;color:var(--ink);font-size:.93rem;transition:transform .18s,background .2s}
+nav a.on{background:var(--tint);color:var(--acc);font-weight:600}
+.msg{padding:13px 16px;border-radius:16px;margin:1em 0}.err{color:var(--red)}
+.chk{display:flex;gap:12px;align-items:center;font-weight:500}.chk input{width:24px;height:24px;padding:0}
+.bar{display:none;height:8px;border-radius:99px;overflow:hidden;margin-top:1em;background:var(--line)}.bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .25s}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}.v{border-radius:18px;overflow:hidden;font-size:.88rem}
+.v img{width:100%;display:block}.v div{padding:10px 12px}.mut{color:var(--mut)}
+table{width:100%;border-collapse:separate;border-spacing:0;border-radius:16px;overflow:hidden;font-size:.9rem}td,th{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line)}
+.ch{display:flex;align-items:center;justify-content:space-between}.ch div{display:flex;gap:6px}.ch a{padding:7px 14px;border-radius:999px;background:var(--glass);border:1px solid var(--edge);font-weight:600}
+.cal{border-radius:22px;overflow:hidden;margin-top:.6em}.cw,.cg{display:grid;grid-template-columns:repeat(7,1fr)}
+.cw span{text-align:center;padding:9px 0;font-size:.78rem;color:var(--mut);border-bottom:1px solid var(--line)}
+.d{min-height:104px;padding:5px 4px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);cursor:pointer;overflow:hidden;transition:background .2s}
+.d:nth-child(7n){border-right:0}.d:active,.d.sel{background:var(--tint)}.d.out{opacity:.38}
+.n{display:inline-flex;width:26px;height:26px;align-items:center;justify-content:center;border-radius:50%;font-size:.9rem;font-weight:500;margin-bottom:2px}
+.today .n{background:var(--red);color:#fff;font-weight:700}
+.e{display:block;font-style:normal;font-size:.68rem;line-height:1.25;padding:2px 5px;margin-top:2px;border-radius:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.e.pub{background:var(--pub)}.e.prog{background:var(--prog)}.more{display:block;font-style:normal;font-size:.68rem;color:var(--mut);padding:1px 5px}
+.ag{margin-top:14px;padding:6px 16px;border-radius:20px}.ag h3{margin:12px 0 4px;font-size:1rem}.ag .it{display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--line);font-size:.92rem}
+.ag .dot{width:4px;border-radius:4px;flex:none}.dot.pub{background:#34c759}.dot.prog{background:#ff9f0a}
+@media(max-width:560px){.d{min-height:74px}.e{font-size:.6rem}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body><main>
 {% if view=='login' %}
 <h1>Accès privé</h1><form method="post"><label>Mot de passe</label>
 <input type="password" name="pw" autofocus><button>Entrer</button>{% if err %}<p class="err">{{err}}</p>{% endif %}</form>
 {% else %}
-<nav>{% for k,l in [('publier','Publier'),('cal','Calendrier'),('biblio','Bibliothèque'),('stats','Stats'),('reglages','Réglages')] %}
-<a class="{{'on' if view==k}}" href="{{ {'publier':'/','cal':'/calendrier','biblio':'/bibliotheque','stats':'/stats','reglages':'/reglages'}[k] }}">{{l}}</a>{% endfor %}</nav>
+<nav>{% for k,l,u in [('publier','Publier','/'),('cal','Calendrier','/calendrier'),('biblio','Bibliothèque','/bibliotheque'),('stats','Stats','/stats'),('reglages','Réglages','/reglages')] %}
+<a class="{{'on' if view==k}}" href="{{u}}">{{l}}</a>{% endfor %}</nav>
 <nav>{% for i,n in chaines %}<a class="{{'on' if i==cid}}" href="/canal/{{i}}?retour={{request.path}}">{{n}}</a>{% endfor %}<a href="/connect">+ Chaîne</a></nav>
 {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
 {% if not cid %}<h1>Connecte ta chaîne YouTube</h1><a class="btn" href="/connect">Connecter ma chaîne</a>
 {% elif view=='publier' %}
-<h1>Poste ta vidéo, le site choisit titre, hashtags et heure.</h1>
-<p>Les choix s’appuient sur les vues de tes vidéos passées. Les titres viennent de ta liste (Réglages).</p>
-<form method="post" action="/upload" enctype="multipart/form-data" onsubmit="w.style.display='block';b.disabled=true;b.textContent='Envoi en cours…'">
+<h1>Dépose ta vidéo.</h1><p>Titre, hashtags et heure sont choisis pour toi d’après tes résultats.</p>
+<form id="fm" method="post" action="/upload" enctype="multipart/form-data">
 <label>Vidéo ou Short</label><input type="file" name="video" accept="video/*" required>
-<label>De quoi parle la vidéo ?</label><textarea name="desc" required></textarea>
-<label>Titre (vide = tiré de ta liste, sinon IA)</label><input name="title">
+<label>Titre (vide = choisi pour toi)</label><input name="title">
+<label>Description (vide = celle des Réglages)</label><textarea name="desc"></textarea>
 <label class="chk"><input type="checkbox" name="short" value="1"> C’est un Short</label>
-<button id="b">Programmer</button><p id="w" style="display:none">Ne ferme pas cet onglet pendant l’envoi.</p></form>
+<div class="bar" id="bar"><i></i></div><p id="wt"></p><button id="bt">Programmer</button></form>
+<script>
+fm.addEventListener('submit',function(e){e.preventDefault();var x=new XMLHttpRequest();x.open('POST','/upload');
+x.upload.onprogress=function(v){if(v.lengthComputable){var p=Math.round(v.loaded/v.total*100);bar.firstChild.style.width=p+'%';wt.textContent=p<100?'Envoi '+p+' %':'Envoi vers YouTube…'}};
+x.onload=function(){if(x.status>=400){wt.textContent='Erreur côté site, réessaie.';bt.disabled=false}else{location.href=x.responseURL||'/'}};
+x.onerror=function(){wt.textContent='Erreur réseau, réessaie.';bt.disabled=false};
+bar.style.display='block';bt.disabled=true;x.send(new FormData(fm))});
+</script>
 {% elif view=='cal' %}
-<h1>Calendrier</h1><p><a href="/calendrier?m={{prec}}">Mois précédent</a> · {{mois}} · <a href="/calendrier?m={{suiv}}">Mois suivant</a></p>
-<div style="overflow-x:auto"><table><tr>{% for j in ['L','M','M','J','V','S','D'] %}<th>{{j}}</th>{% endfor %}</tr>
-{% for s in sem %}<tr>{% for d in s %}<td class="{{'p' if d.month==mo}}" style="{{'opacity:.4' if d.month!=mo}}"><b>{{d.day}}</b>
-{% for v in jours.get(d,[]) %}<div class="{{'pub' if v.pub<now else 'prog'}}">{{v.titre[:28]}}</div>{% endfor %}</td>{% endfor %}</tr>{% endfor %}</table></div>
-<p><span class="pub">Publiée</span> · <span class="prog">Programmée</span></p>
+<div class="ch"><h1>{{titre_mois}}</h1><div><a href="/calendrier?m={{prec}}">‹</a><a href="/calendrier">Aujourd’hui</a><a href="/calendrier?m={{suiv}}">›</a></div></div>
+<div class="cal"><div class="cw">{% for j in ['lun.','mar.','mer.','jeu.','ven.','sam.','dim.'] %}<span>{{j}}</span>{% endfor %}</div>
+<div class="cg">{% for s in sem %}{% for d in s %}<div class="d {{'out' if d.month!=mo}} {{'today' if d==today}}" data-d="{{d.isoformat()}}">
+<span class="n">{{d.day}}</span>{% for v in jours.get(d,[])[:3] %}<i class="e {{'pub' if v.pub<now else 'prog'}}">{{v.titre}}</i>{% endfor %}
+{% if jours.get(d,[])|length>3 %}<i class="more">+{{jours.get(d)|length-3}} de plus</i>{% endif %}</div>{% endfor %}{% endfor %}</div></div>
+<div class="ag g" id="ag"></div>
+<script>
+var A={{agenda|tojson}};var cells=document.querySelectorAll('.d');
+function show(c){cells.forEach(function(x){x.classList.remove('sel')});c.classList.add('sel');var k=c.dataset.d,l=A[k]||[],h='<h3>'+k.split('-').reverse().join('/')+'</h3>';
+if(!l.length)h+='<p>Rien ce jour-là.</p>';l.forEach(function(v){var t=document.createElement('div');t.textContent=v.t;
+h+='<div class="it"><span class="dot '+(v.s=='Publiée'?'pub':'prog')+'"></span><div><b>'+t.innerHTML+'</b><br><span class="mut">'+v.s+' · '+v.h+' · '+v.v+' vues</span></div></div>'});
+document.getElementById('ag').innerHTML=h}
+cells.forEach(function(c){c.addEventListener('click',function(){show(c)})});
+var t=document.querySelector('.today')||document.querySelector('.d:not(.out)');if(t)show(t);
+</script>
 {% elif view=='biblio' %}
 <h1>Bibliothèque</h1><div class="grid">{% for v in vids %}<div class="v"><img src="{{v.img}}" alt=""><div><b>{{v.titre}}</b><br>
 <span class="mut">{{v.vues}} vues · {{v.likes}} j’aime<br>{{'Programmée' if v.pub>now else v.statut}} · {{v.pub.astimezone(tz).strftime('%d/%m %Hh')}}</span></div></div>{% endfor %}</div>
@@ -327,10 +376,11 @@ td.p{background:var(--card)}.pub{color:var(--acc)}.prog{color:#b36b00}.st td{fon
 <h1>Stats</h1><p>{{n}} vidéos récentes · {{total}} vues · {{likes}} j’aime</p>
 <h2>Apprentissage</h2><p>{{nm}} vidéos mesurées sur {{mini}} nécessaires. {{'Actif : le site favorise ce qui marche.' if nm>=mini else 'Phase de test : titres, hashtags et heures varient au hasard.'}}</p>
 {% for nom,l in [('Meilleures heures',heures),('Meilleurs titres',titres),('Meilleurs hashtags',tags)] %}<h2>{{nom}}</h2>
-<table class="st"><tr><th>Valeur</th><th>Vidéos</th><th>Score moyen</th></tr>{% for k,n2,m in l %}<tr><td>{{k}}</td><td>{{n2}}</td><td>{{m}}</td></tr>{% endfor %}</table>{% endfor %}
-<h2>Top vidéos</h2><table class="st">{% for v in meilleures %}<tr><td>{{v.titre}}</td><td>{{v.vues}} vues</td></tr>{% endfor %}</table>
+<table><tr><th>Valeur</th><th>Vidéos</th><th>Score</th></tr>{% for k,n2,m in l %}<tr><td>{{k}}</td><td>{{n2}}</td><td>{{m}}</td></tr>{% endfor %}</table>{% endfor %}
+<h2>Top vidéos</h2><table>{% for v in meilleures %}<tr><td>{{v.titre}}</td><td>{{v.vues}} vues</td></tr>{% endfor %}</table>
 {% elif view=='reglages' %}
 <h1>Réglages</h1><form method="post">
+<label>Description par défaut (utilisée si tu n’en écris pas)</label><textarea name="desc">{{c.desc}}</textarea>
 <label>Tes titres (un par ligne)</label><textarea name="titres">{{c.titres|join('\n')}}</textarea>
 <label>Hashtags fixes (séparés par des virgules)</label><input name="fixes" value="{{c.fixes|join(', ')}}">
 <label>Hashtags à tester</label><textarea name="pool">{{c.pool|join(', ')}}</textarea>
