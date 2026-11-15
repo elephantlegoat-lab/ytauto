@@ -1,4 +1,4 @@
-import os, json, math, random, tempfile, re, calendar, urllib.request, threading, uuid, statistics
+import os, json, math, random, tempfile, re, calendar, urllib.request, threading, uuid, statistics, time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, session, redirect, render_template_string, jsonify
@@ -50,7 +50,7 @@ def active():
 def _env(k): return [x.strip() for x in os.environ.get(k, "").split("|") if x.strip()]
 def config(cid):
     c = {"titres": _env("TITRES"), "oblig": OBLIG_TAGS, "pool": _env("HASHTAGS_TEST"),
-         "heures": DEFAUT_HEURES, "max_jour": 4, "apprentissage": True}
+         "heures": DEFAUT_HEURES, "max_jour": 4, "apprentissage": True, "fond": ""}
     c.update((charger(cid) or {}).get("config", {}))
     if not c["oblig"]: c["oblig"] = OBLIG_TAGS
     return c
@@ -282,6 +282,7 @@ def traiter(cid, jobs):
     finally:
         for j in jobs:
             if os.path.exists(j["path"]): os.unlink(j["path"])
+        CACHE.pop(("h", cid), None)
 
 SOURCES = {"SHORTS": "Shorts", "YT_SEARCH": "Recherche YouTube", "SUGGESTED_VIDEO": "Vidéos suggérées",
            "BROWSE": "Accueil YouTube", "EXT_URL": "Sites externes", "NO_LINK_OTHER": "Direct / autre",
@@ -300,10 +301,15 @@ def analytique(cid, yt, j):
         for x in yt.videos().list(part="snippet", id=",".join(r[0] for r in top)).execute().get("items", []):
             noms[x["id"]] = x["snippet"]["title"]
     S = lambda i: [r[i] for r in jour]
+    tot_ = dict(vues=sum(S(1)), heures=round(sum(S(2)) / 60, 1), likes=sum(S(3)), abos=sum(S(4)) - sum(S(5)))
+    pv = ya.reports().query(ids="channel==MINE", startDate=str(deb - timedelta(days=j + 1)), endDate=str(deb - timedelta(days=1)),
+                            metrics="views,estimatedMinutesWatched,likes,subscribersGained,subscribersLost").execute().get("rows") or [[0] * 5]
+    prev = dict(vues=pv[0][0], heures=round(pv[0][1] / 60, 1), likes=pv[0][2], abos=pv[0][3] - pv[0][4])
+    delta = {k: (round((tot_[k] - prev[k]) / abs(prev[k]) * 100) if prev[k] else None) for k in prev}
     return dict(labels=[r[0][8:] + "/" + r[0][5:7] for r in jour], vues=S(1), heures=[round(m / 60, 2) for m in S(2)],
                 likes=S(3), abos=[a - b for a, b in zip(S(4), S(5))],
                 tot=dict(vues=sum(S(1)), heures=round(sum(S(2)) / 60, 1), likes=sum(S(3)), abos=sum(S(4)) - sum(S(5))),
-                top=[(noms.get(r[0], r[0]), r[1], round(r[2] / 60, 1)) for r in top],
+                delta=delta, top=[(noms.get(r[0], r[0]), r[1], round(r[2] / 60, 1)) for r in top],
                 src=[(SOURCES.get(r[0], r[0]), r[1]) for r in src])
 
 def barres(mon):
@@ -395,6 +401,60 @@ def analyser(hist, ret, seuil):
     return dict(n=len(rows), nb_bons=len(rows) - len(bas), bas=bas[:30], comp=comp, conseils=cs, tags_bons=tags_bons,
                 tags_mauv=tags_mauv, heures=hs, top=sorted(rows, key=lambda r: -r["vpj"])[:8])
 
+CACHE, BADGE = {}, {}
+JOURS = ["LUN.", "MAR.", "MER.", "JEU.", "VEN.", "SAM.", "DIM."]
+ICONS = {
+    "home": '<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>',
+    "upload": '<path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M4 16v4h16v-4"/>',
+    "chart": '<path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/>',
+    "cal": '<rect x="3" y="5" width="18" height="16" rx="3"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+    "grid": '<rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><rect x="13" y="13" width="7" height="7" rx="2"/>',
+    "search": '<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/>',
+    "list": '<path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/>',
+    "sliders": '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>'}
+
+@app.template_filter("k")
+def _k(n):
+    if isinstance(n, float) and abs(n) < 1000: return f"{n:.1f}".rstrip("0").rstrip(".") or "0"
+    n = int(n or 0)
+    if abs(n) >= 1_000_000: return f"{n / 1e6:.1f} M".replace(".0", "")
+    if abs(n) >= 1000: return f"{n / 1000:.1f} k".replace(".0", "")
+    return str(n)
+
+def cache(cle, ttl, fn):
+    t, v = CACHE.get(cle, (0, None))
+    if v is not None and time.time() - t < ttl: return v
+    v = fn(); CACHE[cle] = (time.time(), v); return v
+
+def vues_28j(cid):
+    ya = build("youtubeAnalytics", "v2", credentials=creds_for(cid))
+    fin = datetime.now(TZ).date()
+    rows = ya.reports().query(ids="channel==MINE", startDate=str(fin - timedelta(days=28)), endDate=str(fin),
+                              metrics="views").execute().get("rows", [])
+    return rows[0][0] if rows else 0
+
+def donnees_chaine(cid):
+    """Tout ce qu'il faut pour l'accueil d'une chaîne."""
+    yt, cfg = yt_for(cid), config(cid)
+    hist = historique(yt)
+    ch = yt.channels().list(part="snippet,statistics", mine=True).execute()["items"][0]
+    st = ch["statistics"]; now = datetime.now(timezone.utc); aujourd = datetime.now(TZ).date()
+    loc = lambda v: v["pub"].astimezone(TZ)
+    futur = sorted((v for v in hist if v["pub"] > now), key=lambda v: v["pub"])
+    try: v28 = vues_28j(cid)
+    except Exception: v28 = None
+    def jour_txt(d): return "aujourd’hui" if d == aujourd else "demain" if d == aujourd + timedelta(days=1) else f"{d:%d/%m}"
+    sem = []
+    for i in range(7):
+        j = aujourd + timedelta(days=i)
+        hs = sorted(f"{loc(v):%Hh%M}" for v in hist if loc(v).date() == j)
+        sem.append(dict(jour=j, lab=JOURS[j.weekday()], n=len(hs), heures=hs))
+    BADGE[cid] = len(futur)
+    return dict(cid=cid, nom=ch["snippet"]["title"], img=ch["snippet"]["thumbnails"].get("default", {}).get("url", ""),
+                abos=int(st.get("subscriberCount", 0)), vues=int(st.get("viewCount", 0)), vues28=v28,
+                aujourd=sum(1 for v in hist if loc(v).date() == aujourd), max=int(cfg["max_jour"]), prog=len(futur), sem=sem,
+                futur=[dict(titre=v["titre"], quand=loc(v), iso=v["pub"].isoformat(), jour=jour_txt(loc(v).date())) for v in futur[:6]])
+
 # ---------- accès ----------
 def authed(f):
     def w(*a, **k):
@@ -403,7 +463,10 @@ def authed(f):
     return w
 
 def vue(nom, **kw):
-    return render_template_string(PAGE, view=nom, chaines=liste(), cid=active(), msg=request.args.get("msg"), **kw)
+    cid = active()
+    fond = (config(cid).get("fond") or "") if cid else ""
+    return render_template_string(PAGE, view=nom, chaines=liste(), cid=cid, msg=request.args.get("msg"),
+                                  ICONS=ICONS, BADGE=BADGE, fond=fond, **kw)
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -424,7 +487,23 @@ def canal(cid):
 @app.route("/")
 @authed
 def home():
-    return vue("publier", c=config(active()) if active() else {"max_jour": 4})
+    data = []
+    for c, _ in liste():
+        try: data.append(cache(("h", c), 60, lambda c=c: donnees_chaine(c)))
+        except Exception: pass
+    prog = sorted(((f, d["nom"]) for d in data for f in d["futur"]), key=lambda x: x[0]["quand"])
+    acc = next((d for d in data if d["cid"] == active()), data[0] if data else None)
+    return vue("home", data=data, prog=prog[:5], nxt=prog[0] if prog else None, act=list(reversed(JOBS[-8:])), acc=acc,
+               n_prog=sum(d["prog"] for d in data), n_att=sum(1 for j in JOBS if j["etat"] in ("attente", "envoi")))
+
+@app.route("/publier")
+@authed
+def publier():
+    cid = active(); sem = None
+    if cid:
+        try: sem = cache(("h", cid), 60, lambda: donnees_chaine(cid))["sem"]
+        except Exception: pass
+    return vue("publier", c=config(cid) if cid else {"max_jour": 4}, sem=sem)
 
 @app.route("/connect")
 @authed
@@ -552,89 +631,124 @@ def reglages():
         d["config"] = {"titres": [x.strip() for x in f["titres"].splitlines() if x.strip()],
                        "oblig": sp(f["oblig"]) or OBLIG_TAGS, "pool": sp(f["pool"]),
                        "heures": [int(x) for x in sp(f["heures"]) if x.isdigit() and int(x) < 24] or DEFAUT_HEURES,
-                       "max_jour": max(1, min(10, int(f.get("max_jour") or 4))),
+                       "max_jour": max(1, min(10, int(f.get("max_jour") or 4))), "fond": f.get("fond", "").strip(),
                        "apprentissage": bool(f.get("apprentissage"))}
         sauver(cid, d)
         return redirect("/reglages?msg=Réglages enregistrés.")
     return vue("reglages", c=config(cid))
 
-PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
+PAGE = """{% macro semaine(sem, mx) %}<div class="g wk"><h3>LES 7 PROCHAINS JOURS <em>{{mx}} / jour</em></h3><div class="wd">{% for s in sem %}<div class="dy {{'td' if loop.first}}"><small>{{s.lab}}</small><b>{{s.jour.day}}</b><i class="dots">{% for x in range(mx) %}<u class="{{'f' if x<s.n}}"></u>{% endfor %}</i>{% for h in s.heures %}<span>{{h}}</span>{% endfor %}</div>{% endfor %}</div></div>{% endmacro %}
+<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Programmateur YouTube</title><style>
-:root{--ink:#1c1c1e;--mut:#6e6e73;--glass:rgba(255,255,255,.5);--edge:rgba(255,255,255,.8);--line:rgba(60,60,67,.16);
---acc:#0a84ff;--tint:rgba(10,132,255,.2);--pub:rgba(52,199,89,.3);--prog:rgba(255,159,10,.34);--red:#ff3b30;
---bg:linear-gradient(160deg,#d6e4ff,#f1e6ff 55%,#ffe6dc)}
-@media(prefers-color-scheme:dark){:root{--ink:#f5f5f7;--mut:#a1a1a6;--glass:rgba(255,255,255,.08);--edge:rgba(255,255,255,.16);
---line:rgba(255,255,255,.12);--acc:#64b5ff;--tint:rgba(100,181,255,.22);--pub:rgba(48,209,88,.32);--prog:rgba(255,159,10,.36);
---bg:linear-gradient(160deg,#0a0f1f,#1a1033 55%,#2b1222)}}
+<title>Programmateur YouTube</title><style>:root{--ink:#f5f5f7;--mut:#a3a3ad;--acc:#ff5a36;--blue:#5ab4ff;--pub:rgba(52,199,89,.34);--prog:rgba(255,159,10,.38);--line:rgba(255,255,255,.12);--tint:rgba(255,90,54,.22);--red:#ff5a36}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html{background:var(--bg) fixed;scroll-behavior:smooth}
-body{margin:0;min-height:100vh;color:var(--ink);font:16px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif;
-padding:max(14px,env(safe-area-inset-top)) 16px max(28px,env(safe-area-inset-bottom));-webkit-font-smoothing:antialiased}
-main{max-width:860px;margin:0 auto}
-h1{font-size:1.9rem;font-weight:700;letter-spacing:-.02em;line-height:1.15;margin:.5em 0 .25em}
-h2{font-size:1.05rem;font-weight:600;margin:1.5em 0 .5em}p{color:var(--mut);margin:.2em 0 1em}a{color:var(--acc);text-decoration:none}
-label{display:block;font-weight:600;font-size:.92rem;margin:1.2em 0 .45em}
-.g,input,textarea,button,.btn,nav a,.v,.msg,table,.cal{background:var(--glass);-webkit-backdrop-filter:blur(26px) saturate(1.8);backdrop-filter:blur(26px) saturate(1.8);
-border:1px solid var(--edge);box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 8px 28px rgba(0,0,0,.07)}
-input,textarea{width:100%;font:inherit;color:var(--ink);padding:13px 15px;border-radius:14px;outline:0;transition:box-shadow .2s,border-color .2s}
+html{scroll-behavior:smooth}
+body{margin:0;min-height:100vh;color:var(--ink);font:16px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",sans-serif;-webkit-font-smoothing:antialiased;
+padding:max(12px,env(safe-area-inset-top)) 16px calc(110px + env(safe-area-inset-bottom));
+background:radial-gradient(900px 600px at 12% 8%,rgba(255,90,54,.30),transparent 60%),radial-gradient(900px 650px at 92% 18%,rgba(70,120,255,.32),transparent 60%),radial-gradient(1000px 700px at 55% 105%,rgba(150,60,255,.30),transparent 60%),#08080d fixed;background-attachment:fixed}
+body.fond{background:linear-gradient(rgba(0,0,0,.5),rgba(0,0,0,.62)),var(--img) center/cover fixed}
+main{max-width:1180px;margin:0 auto}
+h1{font-size:1.9rem;font-weight:700;letter-spacing:-.02em;line-height:1.15;margin:.6em 0 .25em}
+h2{font-size:1.05rem;font-weight:600;margin:1.6em 0 .55em}h3{margin:0 0 .5em;font-size:.78rem;letter-spacing:.08em;color:var(--mut);font-weight:700}
+p{color:var(--mut);margin:.2em 0 1em}a{color:var(--blue);text-decoration:none}
+label{display:block;font-weight:600;font-size:.9rem;margin:1.2em 0 .45em}
+.g,input,textarea,.v,.msg,table,.cal,.top,.dock,.dock a,.pill,.tile span,.ring{background:linear-gradient(180deg,rgba(255,255,255,.13),rgba(255,255,255,.05));-webkit-backdrop-filter:blur(30px) saturate(1.8);backdrop-filter:blur(30px) saturate(1.8);
+border:1px solid rgba(255,255,255,.16);box-shadow:inset 0 1px 0 rgba(255,255,255,.2),0 18px 50px rgba(0,0,0,.35)}
+.g{border-radius:26px;padding:16px 18px}
+input,textarea{width:100%;font:inherit;color:var(--ink);padding:13px 15px;border-radius:16px;outline:0;transition:box-shadow .2s,border-color .2s}
 input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--tint)}textarea{min-height:90px;resize:vertical}
-button,.btn{display:block;width:100%;margin-top:1.4em;padding:15px;font:inherit;font-weight:600;color:var(--acc);background:var(--tint);
-border-radius:16px;text-align:center;cursor:pointer;transition:transform .18s cubic-bezier(.2,.8,.2,1),filter .2s}
-button:active,.btn:active,nav a:active{transform:scale(.96)}button:disabled{opacity:.55}
-nav{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}nav a{padding:8px 15px;border-radius:999px;color:var(--ink);font-size:.93rem;transition:transform .18s,background .2s}
-nav a.on{background:var(--tint);color:var(--acc);font-weight:600}
-.msg{padding:13px 16px;border-radius:16px;margin:1em 0}.err{color:var(--red)}
-.chk{display:flex;gap:12px;align-items:center;font-weight:500}.chk input{width:24px;height:24px;padding:0}
+button,.btn{display:block;width:100%;margin-top:1.4em;padding:15px;font:inherit;font-weight:600;color:#fff;background:linear-gradient(180deg,rgba(255,110,70,.55),rgba(255,70,40,.4));border:1px solid rgba(255,255,255,.25);
+box-shadow:inset 0 1px 0 rgba(255,255,255,.3);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);border-radius:18px;text-align:center;cursor:pointer;transition:transform .18s cubic-bezier(.2,.8,.2,1),filter .2s}
+button:active,.btn:active,.tile:active,.dock a:active,.pill:active{transform:scale(.95)}button:disabled{opacity:.55}
+.top{position:sticky;top:max(8px,env(safe-area-inset-top));z-index:10;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 14px;border-radius:999px;margin-bottom:14px}
+.logo{display:flex;width:34px;height:34px;border-radius:11px;background:linear-gradient(180deg,#ff4d3a,#d81f10);align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(255,60,40,.5)}.logo svg{width:16px;height:16px}
+.st{font-size:1rem;margin-right:4px}.pills{display:flex;gap:8px;flex-wrap:wrap}.sp{flex:1}
+.pill{padding:6px 14px;border-radius:999px;color:var(--ink);font-size:.9rem;display:flex;gap:8px;align-items:center;box-shadow:none;transition:transform .18s}
+.pill.on{background:rgba(255,255,255,.2)}.pill em{font-style:normal;font-size:.72rem;background:var(--acc);padding:1px 7px;border-radius:99px;color:#fff;font-weight:700}
+.ok{font-size:.82rem;display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:99px;background:rgba(52,199,89,.18)}.ok i{width:8px;height:8px;border-radius:50%;background:#34c759;box-shadow:0 0 8px #34c759}
+.tb{font-weight:600;font-variant-numeric:tabular-nums;color:var(--mut);padding:0 6px}
+.dock{position:fixed;left:50%;transform:translateX(-50%);bottom:max(14px,env(safe-area-inset-bottom));z-index:20;display:flex;gap:8px;padding:10px;border-radius:28px;max-width:calc(100% - 20px);overflow-x:auto}
+.dock a{width:56px;height:56px;border-radius:18px;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--ink);gap:3px;flex:none;box-shadow:none;transition:transform .18s}
+.dock a.on{background:rgba(255,255,255,.28);box-shadow:inset 0 1px 0 rgba(255,255,255,.4)}.dock svg,.tile svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.dock span{font-size:.58rem;color:var(--mut)}.dock a.on span{color:var(--ink)}
+.hero{display:grid;grid-template-columns:220px 1fr;gap:14px}.clk{padding:14px;display:flex;align-items:center;justify-content:center}.clk svg{width:100%;max-width:190px}
+.big{display:grid;grid-template-columns:1.3fr 1fr;gap:18px;padding:20px 24px}.tm{display:flex;align-items:flex-start;line-height:1}.tm b{font-size:5.2rem;font-weight:800;letter-spacing:-.04em;font-variant-numeric:tabular-nums}.tm sup{font-size:1.5rem;color:var(--acc);margin:.5em 0 0 6px;font-weight:700}
+.dt{font-weight:700;font-size:1.05rem;margin-top:.3em}.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.chips span{font-size:.8rem;padding:6px 12px;border-radius:99px;background:rgba(255,255,255,.12)}
+.ap{border-left:1px solid var(--line);padding-left:18px}.ai{display:flex;gap:10px;padding:7px 0;font-size:.88rem;line-height:1.3}.ai b{color:#fff;font-variant-numeric:tabular-nums;border-left:3px solid var(--acc);padding-left:8px;min-width:62px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px;margin:18px 0}.tile{display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--ink);font-size:.82rem;font-weight:600;transition:transform .18s}
+.tile span{width:68px;height:68px;border-radius:22px;display:flex;align-items:center;justify-content:center}.tile svg{width:28px;height:28px}
+.chs{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px}.cch{display:flex;align-items:center;gap:12px}.cch img{width:46px;height:46px;border-radius:50%;border:2px solid var(--acc)}.cch>div:nth-child(2){flex:1}.cch b{font-size:1.05rem}
+.rg{width:54px;height:54px}.mini{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}.mini .g{padding:10px 14px;border-radius:18px}.mini span{display:block;font-size:.62rem;letter-spacing:.07em;color:var(--mut);font-weight:700}.mini b{font-size:1.5rem}.mini small{color:var(--mut);font-size:.85rem}
+.wid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:14px}
+.nx{display:flex;align-items:center;gap:16px}.nr{position:relative;width:110px;height:110px;flex:none}.nr svg{width:110px;height:110px}.nr div{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:1.35rem;font-weight:800;font-variant-numeric:tabular-nums}.nr small{font-size:.6rem;color:var(--mut);font-weight:500}
+.wk{margin-top:14px}.wk h3 em{float:right;font-style:normal;background:rgba(255,255,255,.12);padding:2px 9px;border-radius:99px;letter-spacing:0}.wd{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+.dy{background:rgba(255,255,255,.07);border-radius:18px;padding:10px 4px;text-align:center;font-size:.7rem;min-height:120px}.dy small{display:block;color:var(--mut);font-weight:700;letter-spacing:.05em}.dy b{display:block;font-size:1.25rem}.dy.td{background:linear-gradient(180deg,rgba(255,90,54,.55),rgba(255,90,54,.25))}.dy.td small{color:#fff}
+.dots{display:flex;justify-content:center;gap:3px;margin:5px 0}.dots u{width:5px;height:5px;border-radius:50%;background:rgba(255,255,255,.2)}.dots u.f{background:#fff}.dy span{display:block;color:var(--mut);font-size:.66rem}.dy.td span{color:#fff}
+.drop{display:flex;flex-direction:column;align-items:center;gap:8px;padding:34px 20px;text-align:center;cursor:pointer;border:1.5px dashed rgba(255,255,255,.3);border-radius:26px;background:rgba(255,255,255,.05);margin:0}.drop.ov{background:var(--tint)}
+.drop svg{width:54px;height:54px;padding:14px;border-radius:18px;background:rgba(255,255,255,.15);fill:none;stroke:#fff;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.drop b{font-size:1.25rem}.drop span{color:var(--mut);font-size:.88rem}.drop em{font-style:normal;color:var(--acc);font-weight:700}
+.msg{padding:13px 16px;border-radius:18px;margin:1em 0}.err{color:#ff7a66}
 .bar{display:none;height:8px;border-radius:99px;overflow:hidden;margin-top:1em;background:var(--line)}.bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .25s}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}.v{border-radius:18px;overflow:hidden;font-size:.88rem}
-.v img{width:100%;display:block}.v div{padding:10px 12px}.mut{color:var(--mut)}
-table{width:100%;border-collapse:separate;border-spacing:0;border-radius:16px;overflow:hidden;font-size:.9rem}td,th{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line)}
-.ch{display:flex;align-items:center;justify-content:space-between}.ch div{display:flex;gap:6px}.ch a{padding:7px 14px;border-radius:999px;background:var(--glass);border:1px solid var(--edge);font-weight:600}
-.cal{border-radius:22px;overflow:hidden;margin-top:.6em}.cw,.cg{display:grid;grid-template-columns:repeat(7,1fr)}
-.cw span{text-align:center;padding:9px 0;font-size:.78rem;color:var(--mut);border-bottom:1px solid var(--line)}
-.d{min-height:104px;padding:5px 4px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);cursor:pointer;overflow:hidden;transition:background .2s}
-.d:nth-child(7n){border-right:0}.d:active,.d.sel{background:var(--tint)}.d.out{opacity:.38}
-.n{display:inline-flex;width:26px;height:26px;align-items:center;justify-content:center;border-radius:50%;font-size:.9rem;font-weight:500;margin-bottom:2px}
-.today .n{background:var(--red);color:#fff;font-weight:700}
-.e{display:block;font-style:normal;font-size:.68rem;line-height:1.25;padding:2px 5px;margin-top:2px;border-radius:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.e.pub{background:var(--pub)}.e.prog{background:var(--prog)}.more{display:block;font-style:normal;font-size:.68rem;color:var(--mut);padding:1px 5px}
-.ag{margin-top:14px;padding:6px 16px;border-radius:20px}.ag h3{margin:12px 0 4px;font-size:1rem}.ag .it{display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--line);font-size:.92rem}
-.ag .dot{width:4px;border-radius:4px;flex:none}.dot.pub{background:#34c759}.dot.prog{background:#ff9f0a}
-.kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:.6em 0}.kpi .g{padding:14px 16px;border-radius:18px}
-.kpi span{display:block;font-size:.8rem;color:var(--mut)}.kpi b{font-size:1.6rem;letter-spacing:-.02em}
-.chart{border-radius:20px;padding:12px 12px 8px}.tip{font-size:.8rem;color:var(--mut);padding:4px 4px 2px;min-height:1.6em}
-.box{border-radius:20px;padding:10px 14px}.row{position:relative;display:flex;justify-content:space-between;padding:8px 0;font-size:.9rem}
-.row i{position:absolute;left:0;bottom:2px;height:3px;border-radius:3px;background:var(--acc);opacity:.7}.row em{font-style:normal;color:var(--mut)}
-.ch a.on{background:var(--tint);color:var(--acc)}
-.pb{margin:10px 0}.pt{display:flex;justify-content:space-between;font-size:.9rem;margin-bottom:5px}.pt b{font-weight:600}
-.tr{height:10px;border-radius:99px;background:var(--line);overflow:hidden}.tr i{display:block;height:100%;border-radius:99px;background:var(--acc);transition:width .4s}
-.job{padding:12px 16px;border-radius:18px;margin:10px 0}.job ul{margin:.4em 0 0;padding-left:1.1em;font-size:.88rem}.job li{margin:.25em 0}
-@media(max-width:560px){.d{min-height:74px}.e{font-size:.6rem}}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}.v{border-radius:20px;overflow:hidden;font-size:.88rem}.v img{width:100%;display:block}.v div{padding:10px 12px}.mut{color:var(--mut)}
+table{width:100%;border-collapse:separate;border-spacing:0;border-radius:20px;overflow:hidden;font-size:.9rem}td,th{padding:10px 14px;text-align:left;border-bottom:1px solid var(--line)}
+.ch{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.ch>div{display:flex;gap:6px}.ch a{padding:7px 14px;border-radius:999px;background:rgba(255,255,255,.1);color:var(--ink);font-weight:600;font-size:.9rem}.ch a.on{background:var(--tint);color:#fff}
+.cal{border-radius:26px;overflow:hidden;margin-top:.6em}.cw,.cg{display:grid;grid-template-columns:repeat(7,1fr)}.cw span{text-align:center;padding:9px 0;font-size:.78rem;color:var(--mut);border-bottom:1px solid var(--line)}
+.d{min-height:104px;padding:5px 4px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);cursor:pointer;overflow:hidden;transition:background .2s}.d:nth-child(7n){border-right:0}.d:active,.d.sel{background:rgba(255,255,255,.12)}.d.out{opacity:.35}
+.n{display:inline-flex;width:26px;height:26px;align-items:center;justify-content:center;border-radius:50%;font-size:.9rem;margin-bottom:2px}.today .n{background:var(--red);color:#fff;font-weight:700}
+.e{display:block;font-style:normal;font-size:.68rem;line-height:1.25;padding:2px 5px;margin-top:2px;border-radius:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.e.pub{background:var(--pub)}.e.prog{background:var(--prog)}.more{display:block;font-style:normal;font-size:.68rem;color:var(--mut);padding:1px 5px}
+.ag{margin-top:14px}.ag h3{margin:6px 0}.it{display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--line);font-size:.92rem}.dot{width:4px;border-radius:4px;flex:none}.dot.pub{background:#34c759}.dot.prog{background:#ff9f0a}
+.chk{display:flex;gap:12px;align-items:center;font-weight:500}.chk input{width:24px;height:24px;padding:0}
+.kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:.8em 0}.kp{margin:0;text-align:left;font-weight:400;color:var(--ink);padding:14px 16px;background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.05));border-radius:22px}.kp.sel{box-shadow:inset 0 0 0 1.5px var(--blue),0 18px 50px rgba(0,0,0,.35)}
+.kp span{display:block;font-size:.8rem;color:var(--mut)}.kp b{font-size:1.8rem;letter-spacing:-.02em;display:block}.kp em{font-style:normal;font-size:.8rem;color:var(--mut)}.kp em.up{color:#34c759}.kp em.dn{color:#ff6b5a}
+.chart{position:relative;padding:14px 14px 8px;border-radius:26px}.chart svg{width:100%;display:block;touch-action:pan-y}.tt{position:absolute;pointer-events:none;background:rgba(20,20,28,.92);border:1px solid var(--line);border-radius:12px;padding:6px 10px;font-size:.8rem;display:none;white-space:nowrap;transform:translate(-50%,-110%)}
+.box{border-radius:24px;padding:10px 16px}.row{position:relative;display:flex;justify-content:space-between;padding:9px 0;font-size:.9rem}.row i{position:absolute;left:0;bottom:2px;height:3px;border-radius:3px;background:var(--blue);opacity:.8}.row em{font-style:normal;color:var(--mut)}
+.pb{margin:12px 0}.pt{display:flex;justify-content:space-between;font-size:.9rem;margin-bottom:6px}.pt b{font-weight:600}.tr{height:10px;border-radius:99px;background:var(--line);overflow:hidden}.tr i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--acc),#ffa05a);transition:width .4s}
+.job{padding:12px 16px;border-radius:20px;margin:10px 0}.job ul{margin:.4em 0 0;padding-left:1.1em;font-size:.88rem}.job li{margin:.25em 0}
+@media(max-width:820px){.hero{grid-template-columns:1fr}.big{grid-template-columns:1fr}.ap{border-left:0;padding-left:0}.tm b{font-size:4rem}.d{min-height:74px}.e{font-size:.6rem}.wd{gap:4px}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
-</style></head><body><main>
+</style></head><body class="{{'fond' if fond}}" style="{{'--img:url('~fond~')' if fond}}"><main>
 {% if view=='login' %}
 <h1>Accès privé</h1><form method="post"><label>Mot de passe</label>
 <input type="password" name="pw" autofocus><button>Entrer</button>{% if err %}<p class="err">{{err}}</p>{% endif %}</form>
 {% else %}
-<nav>{% for k,l,u in [('publier','Publier','/'),('file','File','/file'),('cal','Calendrier','/calendrier'),('biblio','Bibliothèque','/bibliotheque'),('stats','Stats','/stats'),('diag','Diagnostic','/diagnostic'),('reglages','Réglages','/reglages')] %}
-<a class="{{'on' if view==k}}" href="{{u}}">{{l}}</a>{% endfor %}</nav>
-<nav>{% for i,n in chaines %}<a class="{{'on' if i==cid}}" href="/canal/{{i}}?retour={{request.path}}">{{n}}</a>{% endfor %}<a href="/connect">+ Chaîne</a></nav>
+<header class="top"><a class="logo" href="/"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></a><b class="st">Studio</b>
+<div class="pills">{% for i,n in chaines %}<a class="pill {{'on' if i==cid}}" href="/canal/{{i}}?retour={{request.path}}">{{n}}{% if BADGE.get(i) %}<em>{{BADGE[i]}}</em>{% endif %}</a>{% endfor %}<a class="pill" href="/connect">+ Chaîne</a></div>
+<span class="sp"></span><span class="ok"><i></i>Connecté</span><span id="tb" class="tb"></span></header>
+<nav class="dock">{% for k,l,u,i in [('home','Accueil','/','home'),('publier','Publier','/publier','upload'),('stats','Stats','/stats','chart'),('cal','Agenda','/calendrier','cal'),('biblio','Vidéos','/bibliotheque','grid'),('diag','Analyse','/diagnostic','search'),('file','File','/file','list'),('reglages','Réglages','/reglages','sliders')] %}<a class="{{'on' if view==k}}" href="{{u}}"><svg viewBox="0 0 24 24">{{ICONS[i]|safe}}</svg><span>{{l}}</span></a>{% endfor %}</nav>
 {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
 {% if not cid %}<h1>Connecte ta chaîne YouTube</h1><a class="btn" href="/connect">Connecter ma chaîne</a>
+{% elif view=='home' %}
+{% if not data %}<div class="msg">Données YouTube indisponibles pour l’instant. Réessaie dans un instant.</div>{% endif %}
+<div class="hero"><div class="g clk"><svg id="ck" viewBox="0 0 200 200"><circle cx="100" cy="100" r="97" fill="rgba(0,0,0,.28)" stroke="rgba(255,255,255,.22)" stroke-width="2"/>
+<line id="hh" x1="100" y1="100" x2="100" y2="58" stroke="#fff" stroke-width="5" stroke-linecap="round"/><line id="mm" x1="100" y1="100" x2="100" y2="32" stroke="#fff" stroke-width="3.5" stroke-linecap="round"/>
+<line id="ss" x1="100" y1="112" x2="100" y2="22" stroke="#ff5a36" stroke-width="1.8" stroke-linecap="round"/><circle cx="100" cy="100" r="4.5" fill="#ff5a36"/></svg></div>
+<div class="g big"><div><span id="gr" class="mut"></span><div class="tm"><b id="hm">--:--</b><sup id="sc"></sup></div><div class="dt" id="dt"></div>
+<div class="chips"><span>{{n_prog}} programmée(s)</span><span>{{n_att}} en attente</span><span>{{chaines|length}} chaîne(s)</span></div></div>
+<div class="ap"><h3>AU PROGRAMME</h3>{% for f,nom in prog %}<div class="ai"><b>{{f.quand.strftime('%H:%M')}}</b><div>{{f.titre[:36]}}<br><span class="mut">{{nom}} · {{f.jour}}</span></div></div>{% else %}<p>Rien de programmé pour l’instant.</p>{% endfor %}</div></div></div>
+<div class="tiles">{% for u,l,i in [('/publier','Publier','upload'),('/stats','Analytique','chart'),('/calendrier','Calendrier','cal'),('/bibliotheque','Bibliothèque','grid'),('/diagnostic','Diagnostic','search'),('/reglages','Réglages','sliders')] %}
+<a class="tile" href="{{u}}"><span><svg viewBox="0 0 24 24">{{ICONS[i]|safe}}</svg></span>{{l}}</a>{% endfor %}</div>
+<div class="chs">{% for d in data %}<div class="g"><div class="cch"><img src="{{d.img}}" alt=""><div><b>{{d.nom}}</b><br><span class="mut">{{d.abos}} abonnés · {{d.vues|k}} vues au total</span></div>
+<svg class="rg" viewBox="0 0 54 54"><circle cx="27" cy="27" r="22" fill="none" stroke="rgba(255,255,255,.15)" stroke-width="5"/><circle cx="27" cy="27" r="22" fill="none" stroke="#ff5a36" stroke-width="5" stroke-linecap="round" stroke-dasharray="138.2" stroke-dashoffset="{{(138.2*(1-([d.aujourd/d.max,1]|min)))|round(1)}}" transform="rotate(-90 27 27)"/><text x="27" y="32" text-anchor="middle" fill="#fff" font-size="15" font-weight="700">{{d.aujourd}}</text></svg></div>
+<div class="mini"><div class="g"><span>AUJOURD’HUI</span><b>{{d.aujourd}}<small>/{{d.max}}</small></b></div><div class="g"><span>PROGRAMMÉES</span><b>{{d.prog}}</b></div><div class="g"><span>VUES 28 J</span><b>{{d.vues28|k if d.vues28 is not none else '–'}}</b></div></div></div>{% endfor %}</div>
+<div class="wid"><div class="g"><h3>PROCHAINE PUBLICATION</h3>{% if nxt %}<div class="nx"><div class="nr" id="nr" data-iso="{{nxt[0].iso}}"><svg viewBox="0 0 110 110"><circle cx="55" cy="55" r="48" fill="none" stroke="rgba(255,255,255,.14)" stroke-width="8"/><circle id="nrc" cx="55" cy="55" r="48" fill="none" stroke="#ff5a36" stroke-width="8" stroke-linecap="round" stroke-dasharray="301.6" stroke-dashoffset="301.6" transform="rotate(-90 55 55)"/></svg><div><span id="nt">--:--</span><small>h:min</small></div></div>
+<div><b>{{nxt[0].titre[:40]}}</b><br><span class="mut">{{nxt[1]}}<br>{{nxt[0].jour}} à {{nxt[0].quand.strftime('%H:%M')}}</span></div></div>{% else %}<p>Aucune vidéo programmée.</p>{% endif %}</div>
+<div class="g"><h3>ACTIVITÉ</h3>{% for j in act %}<div class="it"><span class="dot {{'pub' if j.etat=='ok' else 'prog'}}"></span><div>{{(j.titre or j.nom)[:42]}}<br><span class="mut">{{ {'ok':'Programmée','erreur':'Erreur','envoi':'Envoi en cours','attente':'En attente'}[j.etat] }}{% if j.quand %} · {{j.quand}}{% endif %}</span></div></div>{% else %}<p>Aucune activité récente.</p>{% endfor %}</div>
+<div class="g"><h3>OBJECTIFS</h3>{% if acc %}<div class="pb"><div class="pt"><span>Monétisation : abonnés</span><b>{{acc.abos}} / 1000</b></div><div class="tr"><i style="width:{{[acc.abos/10,100]|min}}%"></i></div></div><p style="font-size:.8rem"><a href="/stats">Voir toute la progression</a></p>{% endif %}</div></div>
+{% if acc %}{{semaine(acc.sem,acc.max)}}{% endif %}
 {% elif view=='publier' %}
 <h1>Dépose tes vidéos.</h1><p>Tu peux en choisir plusieurs. Maximum {{c.max_jour}} par jour, publiées 5 min avant les heures de pointe. Le jour suivant se remplit tout seul.</p>
 <form id="fm" method="post" action="/upload" enctype="multipart/form-data">
-<label>Vidéos ou Shorts</label><input type="file" name="video" accept="video/*" multiple required>
+<label class="drop" id="dz" for="vf"><svg viewBox="0 0 24 24">{{ICONS['upload']|safe}}</svg><b>Dépose tes vidéos ici</b><span>ou touche pour les choisir : titre, hashtags et horaire sont choisis tout seuls</span><em id="nf"></em></label>
+<input id="vf" name="video" type="file" accept="video/*" multiple hidden>
 <label>Titre (facultatif, seulement si tu envoies une seule vidéo)</label><input name="title">
 <div class="bar" id="bar"><i></i></div><p id="wt"></p><button id="bt">Programmer</button></form>
 <script>
-fm.addEventListener('submit',function(e){e.preventDefault();var x=new XMLHttpRequest();x.open('POST','/upload');
+vf.addEventListener('change',function(){nf.textContent=vf.files.length?vf.files.length+' vidéo(s) choisie(s)':''});dz.addEventListener('dragover',function(e){e.preventDefault();dz.classList.add('ov')});dz.addEventListener('dragleave',function(){dz.classList.remove('ov')});dz.addEventListener('drop',function(e){e.preventDefault();dz.classList.remove('ov');vf.files=e.dataTransfer.files;nf.textContent=vf.files.length+' vidéo(s) choisie(s)'});
+fm.addEventListener('submit',function(e){e.preventDefault();if(!vf.files.length){wt.textContent='Choisis au moins une vidéo.';return}var x=new XMLHttpRequest();x.open('POST','/upload');
 x.upload.onprogress=function(v){if(v.lengthComputable){var p=Math.round(v.loaded/v.total*100);bar.firstChild.style.width=p+'%';wt.textContent=p<100?'Envoi '+p+' %':'Réception terminée…'}};
 x.onload=function(){if(x.status>=400){wt.textContent='Erreur côté site, réessaie.';bt.disabled=false}else{location.href=x.responseURL||'/'}};
 x.onerror=function(){wt.textContent='Erreur réseau, réessaie.';bt.disabled=false};
 bar.style.display='block';bt.disabled=true;x.send(new FormData(fm))});
 </script>
+{% if sem %}{{semaine(sem,c.max_jour)}}{% endif %}
 {% elif view=='cal' %}
 <div class="ch"><h1>{{titre_mois}}</h1><div><a href="/calendrier?m={{prec}}">‹</a><a href="/calendrier">Aujourd’hui</a><a href="/calendrier?m={{suiv}}">›</a></div></div>
 <div class="cal"><div class="cw">{% for j in ['lun.','mar.','mer.','jeu.','ven.','sam.','dim.'] %}<span>{{j}}</span>{% endfor %}</div>
@@ -660,25 +774,29 @@ var t=document.querySelector('.today')||document.querySelector('.d:not(.out)');i
 1) Dans Google Cloud, active « YouTube Analytics API ». 2) Reconnecte ta chaîne avec le bouton ci-dessous.
 <a class="btn" href="/connect">Reconnecter ma chaîne</a><p style="font-size:.75rem">{{err}}</p></div>
 {% elif an %}
-<div class="kpi">{% for t,vl in [('Vues',an.tot.vues),('Heures vues',an.tot.heures),('Abonnés',an.tot.abos),('J’aime',an.tot.likes)] %}
-<div class="g"><span>{{t}}</span><b>{{vl}}</b></div>{% endfor %}</div>
-{% for k,t in [('vues','Vues par jour'),('heures','Heures de visionnage par jour'),('abos','Abonnés gagnés par jour'),('likes','J’aime par jour')] %}
-<h2>{{t}}</h2><div class="g chart" id="c_{{k}}"></div>{% endfor %}
-<h2>D’où viennent tes vues</h2><div class="g box">{% for nom,vl in an.src %}<div class="row"><span>{{nom}}</span><i style="width:{{(vl/an.src[0][1]*100)|round}}%"></i><em>{{vl}}</em></div>{% endfor %}</div>
-<h2>Meilleures vidéos</h2><table>{% for t,vl,h in an.top %}<tr><td>{{t}}</td><td>{{vl}} vues</td><td>{{h}} h</td></tr>{% endfor %}</table>
+<div class="kpi">{% for k,t,vl in [('vues','Vues',an.tot.vues),('heures','Heures de visionnage',an.tot.heures),('abos','Abonnés',an.tot.abos),('likes','J’aime',an.tot.likes)] %}
+<button type="button" class="g kp {{'sel' if k=='vues'}}" data-k="{{k}}"><span>{{t}}</span><b>{{vl|k}}</b>{% set dl=an.delta[k] %}<em class="{{'up' if dl and dl>0 else 'dn' if dl and dl<0}}">{% if dl is none %}—{% else %}{{'+' if dl>0}}{{dl}} % vs période précédente{% endif %}</em></button>{% endfor %}</div>
+<div class="g chart" id="ch"></div>
+<h2>Comment les gens te trouvent</h2><div class="g box">{% for nom,vl in an.src %}<div class="row"><span>{{nom}}</span><i style="width:{{(vl/an.src[0][1]*100)|round}}%"></i><em>{{vl}}</em></div>{% endfor %}</div>
+<h2>Contenu le plus regardé</h2><table>{% for t,vl,h in an.top %}<tr><td>{{loop.index}}</td><td>{{t}}</td><td>{{vl}} vues</td><td>{{h}} h</td></tr>{% endfor %}</table>
 <script>
-var AN={{an|tojson}};
-function chart(id,labels,vals){var el=document.getElementById('c_'+id),W=600,H=170,p=8,n=vals.length;if(!n){el.textContent='Pas encore de données.';return}
-var mx=Math.max.apply(null,vals.concat([1])),pts=vals.map(function(v,i){return[p+i*(W-2*p)/Math.max(n-1,1),H-p-(Math.max(v,0)/mx)*(H-2*p-16)]});
-var d=pts.map(function(q,i){return(i?'L':'M')+q[0].toFixed(1)+' '+q[1].toFixed(1)}).join('');
-el.innerHTML='<svg viewBox="0 0 '+W+' '+H+'" width="100%" style="touch-action:pan-y"><defs><linearGradient id="g'+id+'" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--acc);stop-opacity:.35"/><stop offset="1" style="stop-color:var(--acc);stop-opacity:0"/></linearGradient></defs>'
-+'<path d="'+d+'L'+pts[n-1][0]+' '+H+'L'+pts[0][0]+' '+H+'Z" fill="url(#g'+id+')"/><path d="'+d+'" fill="none" style="stroke:var(--acc)" stroke-width="2.5" stroke-linejoin="round"/>'
-+'<line y1="0" y2="'+H+'" style="stroke:var(--mut);display:none" stroke-dasharray="3"/><circle r="5" style="fill:var(--acc);display:none"/></svg><div class="tip">'+labels[0]+' → '+labels[n-1]+' · appuie sur le graphique</div>';
-var svg=el.querySelector('svg'),tip=el.querySelector('.tip'),ln=svg.querySelector('line'),dt=svg.querySelector('circle');
-function mv(e){var r=svg.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W,i=Math.max(0,Math.min(n-1,Math.round((x-p)/((W-2*p)/Math.max(n-1,1)))));
-ln.setAttribute('x1',pts[i][0]);ln.setAttribute('x2',pts[i][0]);ln.style.display='';dt.setAttribute('cx',pts[i][0]);dt.setAttribute('cy',pts[i][1]);dt.style.display='';tip.textContent=labels[i]+' : '+vals[i]}
+var AN={{an|tojson}},NM={vues:'vues',heures:'h',abos:'abonnés',likes:'j’aime'};
+function nice(m){if(m<=0)return 1;var e=Math.pow(10,Math.floor(Math.log(m)/Math.LN10)),f=m/e;return(f<=1?1:f<=2?2:f<=5?5:10)*e}
+function fk(x){var a=Math.abs(x);return a>=1e6?(x/1e6).toFixed(1).replace('.0','')+' M':a>=1000?(x/1000).toFixed(1).replace('.0','')+' k':(Math.round(x*10)/10)+''}
+function draw(k){var el=document.getElementById('ch'),v=AN[k],L=AN.labels,n=v.length;if(!n){el.textContent='Pas encore de données.';return}
+var W=900,H=300,pl=48,pr=14,pt=14,pb=30,hi=nice(Math.max.apply(null,v)),lo=Math.min(0,Math.min.apply(null,v));if(lo<0)lo=-nice(-lo);
+var X=function(i){return pl+i*(W-pl-pr)/Math.max(n-1,1)},Y=function(x){return pt+(1-(x-lo)/(hi-lo))*(H-pt-pb)};
+var g='',i;for(i=0;i<=4;i++){var gv=lo+(hi-lo)*i/4,gy=Y(gv);g+='<line x1="'+pl+'" x2="'+(W-pr)+'" y1="'+gy+'" y2="'+gy+'" stroke="rgba(255,255,255,.1)"/><text x="'+(pl-8)+'" y="'+(gy+4)+'" text-anchor="end" fill="#a3a3ad" font-size="12">'+fk(gv)+'</text>'}
+for(i=0;i<5;i++){var xi=Math.round(i*(n-1)/4);g+='<text x="'+X(xi)+'" y="'+(H-8)+'" text-anchor="middle" fill="#a3a3ad" font-size="12">'+L[xi]+'</text>'}
+var d='M'+X(0)+' '+Y(v[0]);for(i=1;i<n;i++){var mx=(X(i-1)+X(i))/2;d+=' C'+mx+' '+Y(v[i-1])+' '+mx+' '+Y(v[i])+' '+X(i)+' '+Y(v[i])}
+el.innerHTML='<svg viewBox="0 0 '+W+' '+H+'"><defs><linearGradient id="gr" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5ab4ff" stop-opacity=".45"/><stop offset="1" stop-color="#5ab4ff" stop-opacity="0"/></linearGradient></defs>'+g+'<path d="'+d+' L'+X(n-1)+' '+Y(lo)+' L'+X(0)+' '+Y(lo)+'Z" fill="url(#gr)"/><path d="'+d+'" fill="none" stroke="#5ab4ff" stroke-width="3" stroke-linecap="round"/><line id="cl" y1="'+pt+'" y2="'+(H-pb)+'" stroke="rgba(255,255,255,.4)" stroke-dasharray="4" style="display:none"/><circle id="cd" r="6" fill="#5ab4ff" stroke="#fff" stroke-width="2" style="display:none"/></svg><div class="tt" id="tt"></div>';
+var svg=el.querySelector('svg'),tt=document.getElementById('tt'),cl=document.getElementById('cl'),cd=document.getElementById('cd');
+function mv(e){var r=svg.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W,j=Math.max(0,Math.min(n-1,Math.round((x-pl)/((W-pl-pr)/Math.max(n-1,1)))));
+cl.setAttribute('x1',X(j));cl.setAttribute('x2',X(j));cl.style.display='';cd.setAttribute('cx',X(j));cd.setAttribute('cy',Y(v[j]));cd.style.display='';
+tt.style.display='block';tt.style.left=(svg.offsetLeft+X(j)/W*r.width)+'px';tt.style.top=(svg.offsetTop+Y(v[j])/H*r.height)+'px';tt.innerHTML='<b>'+L[j]+'</b> · '+fk(v[j])+' '+NM[k]}
 svg.addEventListener('pointermove',mv);svg.addEventListener('pointerdown',mv)}
-['vues','heures','abos','likes'].forEach(function(k){chart(k,AN.labels,AN[k])});
+document.querySelectorAll('.kp').forEach(function(b){b.addEventListener('click',function(){document.querySelectorAll('.kp').forEach(function(x){x.classList.remove('sel')});b.classList.add('sel');draw(b.dataset.k)})});
+draw('vues');
 </script>
 {% endif %}
 <h2>Ce que le site a appris</h2><p>{{nm}} vidéos mesurées sur {{mini}} nécessaires. {{'Actif : titres, hashtags et heures s’adaptent à ce qui marche.' if nm>=mini else 'Phase de test : il essaie des variantes pour voir ce qui marche.'}}</p>
@@ -722,7 +840,17 @@ load();setInterval(load,3000);
 <label>Hashtags candidats en plus (le site choisit les meilleurs parmi eux, 15 par vidéo)</label><textarea name="pool">{{c.pool|join(', ')}}</textarea>
 <label>Heures de pointe (YouTube Studio, onglet Audience). Publication 5 min avant.</label><input name="heures" value="{{c.heures|join(', ')}}">
 <label>Vidéos maximum par jour</label><input name="max_jour" type="number" min="1" max="10" value="{{c.max_jour}}">
+<label>Image de fond (lien, facultatif)</label><input name="fond" value="{{c.fond}}" placeholder="https://…">
 <label class="chk"><input type="checkbox" name="apprentissage" {{'checked' if c.apprentissage}}> Apprendre de mes résultats</label>
 <button>Enregistrer</button></form>
 {% endif %}{% endif %}
-</main></body></html>"""
+</main>{% if view!='login' %}<script>
+(function(){var $=function(i){return document.getElementById(i)};function p2(n){return(n<10?'0':'')+n}
+function tick(){var d=new Date(),h=d.getHours();if($('tb'))$('tb').textContent=p2(h)+':'+p2(d.getMinutes());
+if($('hm')){$('hm').textContent=p2(h)+':'+p2(d.getMinutes());$('sc').textContent=p2(d.getSeconds());$('gr').textContent=h<5?'Bonne nuit':h<12?'Bonjour':h<18?'Bon après-midi':'Bonsoir';
+var s=d.toLocaleDateString('fr-FR',{weekday:'long',day:'numeric',month:'long',year:'numeric'});$('dt').textContent=s.charAt(0).toUpperCase()+s.slice(1)}
+if($('ck')){var sc=d.getSeconds(),m=d.getMinutes()+sc/60,hh=h%12+m/60;$('hh').setAttribute('transform','rotate('+hh*30+' 100 100)');$('mm').setAttribute('transform','rotate('+m*6+' 100 100)');$('ss').setAttribute('transform','rotate('+sc*6+' 100 100)')}
+var nr=$('nr');if(nr){var rem=new Date(nr.dataset.iso)-d;if(rem<0)rem=0;var mn=Math.floor(rem/60000);$('nt').textContent=p2(Math.floor(mn/60))+':'+p2(mn%60);$('nrc').setAttribute('stroke-dashoffset',Math.min(rem,864e5)/864e5*301.6)}}
+if($('ck')){var t='';for(var i=0;i<60;i++){var a=i*6*Math.PI/180,l=i%5?4:9;t+='<line x1="'+(100+Math.sin(a)*(90-l))+'" y1="'+(100-Math.cos(a)*(90-l))+'" x2="'+(100+Math.sin(a)*90)+'" y2="'+(100-Math.cos(a)*90)+'" stroke="rgba(255,255,255,'+(i%5?.35:.9)+')" stroke-width="'+(i%5?1:2.4)+'"/>'}$('ck').insertAdjacentHTML('afterbegin',t)}
+tick();setInterval(tick,1000)})();
+</script>{% endif %}</body></html>"""
