@@ -66,15 +66,26 @@ def best_slot(yt):
     return t.astimezone(timezone.utc), top, f"ton meilleur créneau : {jours[wd]} à {h}h"
 
 def make_title(desc, top):
-    import anthropic
-    r = anthropic.Anthropic().messages.create(
-        model="claude-sonnet-5-5", max_tokens=100,
-        messages=[{"role": "user", "content":
-            "Voici les titres qui ont le mieux marché sur ma chaîne YouTube :\n- " + "\n- ".join(top)
-            + f"\n\nDescription de ma nouvelle vidéo : {desc}\n\n"
-            "Écris UN seul titre accrocheur (max 70 caractères), dans le même style et la même langue. "
-            "Réponds uniquement par le titre."}])
-    return r.content[0].text.strip().strip('"')
+    """Titre via Gemini (clé gratuite). Si ça échoue : première ligne de la description."""
+    fallback = (desc.strip().splitlines() or ["Nouvelle vidéo"])[0][:90]
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return fallback
+    import urllib.request
+    prompt = ("Voici les titres qui ont le mieux marché sur ma chaîne YouTube :\n- " + "\n- ".join(top)
+              + f"\n\nDescription de ma nouvelle vidéo : {desc}\n\n"
+              "Écris UN seul titre accrocheur (max 70 caractères), dans le même style et la même langue. "
+              "Réponds uniquement par le titre.")
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        data=json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode(),
+        headers={"Content-Type": "application/json", "x-goog-api-key": key})
+    try:
+        r = json.load(urllib.request.urlopen(req, timeout=30))
+        return r["candidates"][0]["content"]["parts"][0]["text"].strip().strip('"')[:100]
+    except Exception:
+        return fallback
 
 def authed(f):
     def w(*a, **k):
