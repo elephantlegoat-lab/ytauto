@@ -1,4 +1,4 @@
-import os, json, math, random, tempfile, re, calendar, urllib.request, threading, uuid, statistics, time
+import os, json, math, random, tempfile, re, calendar, urllib.request, threading, uuid, statistics, time, base64, hmac, urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, session, redirect, render_template_string, jsonify
@@ -17,7 +17,8 @@ TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Paris"))
 DATA = os.environ.get("DATA_DIR", "data")
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
           "https://www.googleapis.com/auth/youtube.readonly",
-          "https://www.googleapis.com/auth/yt-analytics.readonly"]
+          "https://www.googleapis.com/auth/yt-analytics.readonly"] + (
+    ["https://www.googleapis.com/auth/gmail.send"] if os.environ.get("NOTIF_EMAIL") else [])
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 os.makedirs(DATA + "/chaines", exist_ok=True)
 DEFAUT_TAGS = ["#asmr", "#shorts", "#asmrshorts", "#asmrman", "#fyp", "#satisfying", "#relax", "#relaxation",
@@ -478,8 +479,105 @@ def donnees_chaine(cid):
     BADGE[cid] = len(futur)
     return dict(cid=cid, nom=ch["snippet"]["title"], img=ch["snippet"]["thumbnails"].get("default", {}).get("url", ""),
                 abos=int(st.get("subscriberCount", 0)), vues=int(st.get("viewCount", 0)), vues28=v28,
-                aujourd=sum(1 for v in hist if loc(v).date() == aujourd), max=int(cfg["max_jour"]), prog=len(futur), sem=sem,
+                aujourd=sum(1 for v in hist if loc(v).date() == aujourd), max=int(cfg["max_jour"]), prog=len(futur), sem=sem, stock=stock(hist, cfg),
                 futur=[dict(titre=v["titre"], quand=loc(v), iso=v["pub"].isoformat(), jour=jour_txt(loc(v).date())) for v in futur[:6]])
+
+def stock(hist, cfg):
+    """Combien de jours de vidéos programmées il reste."""
+    mx = max(1, int(cfg["max_jour"])); now = datetime.now(timezone.utc); auj = datetime.now(TZ).date()
+    futur = [v for v in hist if v["pub"] > now]; occ = occupation(hist)
+    d, cv = auj + timedelta(days=1), 0
+    while len(occ.get(d, [])) >= mx and cv < 60: cv += 1; d += timedelta(days=1)
+    j = len(futur) / mx
+    return dict(videos=len(futur), jours=int(j) if j == int(j) else round(j, 1), couverts=cv, max=mx,
+                demain=len(occ.get(auj + timedelta(days=1), [])),
+                dernier=max((v["pub"].astimezone(TZ).date() for v in futur), default=None))
+
+def tel_e164(t):
+    t = re.sub(r"\D", "", t or "")
+    return ("+33" + t[1:]) if t.startswith("0") else ("+" + t if t else "")
+
+def moyens():
+    m = []
+    if os.environ.get("NTFY_TOPIC"): m.append("notification push (ntfy)")
+    if all(os.environ.get(k) for k in ("TWILIO_SID", "TWILIO_TOKEN", "TWILIO_FROM", "NOTIF_TEL")): m.append("SMS")
+    if os.environ.get("NOTIF_EMAIL"): m.append("e-mail")
+    return m
+
+def notifier(sujet, texte, cid):
+    """Envoie par tous les moyens configurés. Retourne [(moyen, ok, erreur)]."""
+    res = []
+    topic = os.environ.get("NTFY_TOPIC")
+    if topic:
+        try:
+            urllib.request.urlopen(urllib.request.Request("https://ntfy.sh/", headers={"Content-Type": "application/json"},
+                data=json.dumps({"topic": topic, "title": sujet, "message": texte, "priority": 4}).encode()), timeout=20)
+            res.append(("push", True, ""))
+        except Exception as e: res.append(("push", False, str(e)[:120]))
+    sid, tok, frm, tel = (os.environ.get(k) for k in ("TWILIO_SID", "TWILIO_TOKEN", "TWILIO_FROM", "NOTIF_TEL"))
+    if sid and tok and frm and tel:
+        try:
+            rq = urllib.request.Request(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
+                data=urllib.parse.urlencode({"To": tel_e164(tel), "From": frm, "Body": (sujet + "\n" + texte)[:1500]}).encode())
+            rq.add_header("Authorization", "Basic " + base64.b64encode(f"{sid}:{tok}".encode()).decode())
+            urllib.request.urlopen(rq, timeout=20); res.append(("SMS", True, ""))
+        except Exception as e: res.append(("SMS", False, str(e)[:120]))
+    mail = os.environ.get("NOTIF_EMAIL")
+    if mail and cid:
+        try:
+            from email.mime.text import MIMEText
+            from email.header import Header
+            m = MIMEText(texte, "plain", "utf-8"); m["to"] = mail; m["subject"] = Header(sujet, "utf-8")
+            build("gmail", "v1", credentials=creds_for(cid)).users().messages().send(
+                userId="me", body={"raw": base64.urlsafe_b64encode(m.as_bytes()).decode()}).execute()
+            res.append(("e-mail", True, ""))
+        except Exception as e:
+            res.append(("e-mail", False, "active Gmail API dans Google Cloud et reconnecte ta chaîne (" + str(e)[:80] + ")"))
+    return res
+
+def bilan_texte(cid, nom, yt, hist, cfg):
+    an = analytique(cid, yt, 7); t, d = an["tot"], an["delta"]
+    fmt = lambda k: f" ({d[k]:+d} %)" if d.get(k) is not None else ""
+    now = datetime.now(timezone.utc)
+    posts = sum(1 for v in hist if v["pub"] <= now and (now - v["pub"]).days < 7)
+    s = stock(hist, cfg)
+    L = [f"Bilan de la semaine — {nom}", f"Vues : {t['vues']}{fmt('vues')}", f"Heures vues : {t['heures']}{fmt('heures')}",
+         f"Abonnés gagnés : {t['abos']:+d}{fmt('abos')}", f"J'aime : {t['likes']}{fmt('likes')}", f"Vidéos publiées : {posts}"]
+    if an["top"]: L.append("Top : " + " | ".join(f"{n[:30]} ({v} vues)" for n, v, h in an["top"][:3]))
+    L.append(f"Stock restant : {s['videos']} vidéo(s), {s['jours']} jour(s)")
+    L.append("(Chiffres confirmés par YouTube, avec 2 à 3 jours de retard.)")
+    return "\n".join(L)
+
+def lire_etat():
+    try: return json.load(open(DATA + "/notif.json"))
+    except Exception: return {}
+
+def verifier():
+    """Alerte stock bas (8h-22h, au plus toutes les 12 h) + bilan le vendredi soir (dès 18h, une fois)."""
+    if not moyens(): return
+    now = datetime.now(TZ); etat = lire_etat(); mini = int(os.environ.get("NOTIF_JOURS", "1"))
+    for cid, nom in liste():
+        try:
+            yt = yt_for(cid); cfg = config(cid); hist = historique(yt); s = stock(hist, cfg)
+            cle = f"stock:{cid}"
+            if 8 <= now.hour < 22 and s["couverts"] < mini and time.time() - etat.get(cle, 0) > 12 * 3600:
+                msg = (f"{nom} : plus aucune vidéo programmée. Ajoutes-en sur le site." if not s["videos"] else
+                       f"{nom} : stock bas. Demain : {s['demain']}/{s['max']} vidéos. Stock total : {s['videos']} vidéo(s), {s['jours']} jour(s). Ajoutes-en sur le site.")
+                if any(ok for _, ok, _ in notifier("Pense à ajouter des vidéos", msg, cid)): etat[cle] = time.time()
+            cle = f"bilan:{cid}"
+            if now.weekday() == 4 and now.hour >= 18 and etat.get(cle) != str(now.date()):
+                if any(ok for _, ok, _ in notifier(f"Bilan de la semaine — {nom}", bilan_texte(cid, nom, yt, hist, cfg), cid)):
+                    etat[cle] = str(now.date())
+        except Exception: continue
+    try: json.dump(etat, open(DATA + "/notif.json", "w"))
+    except Exception: pass
+
+def boucle():
+    time.sleep(60)
+    while True:
+        try: verifier()
+        except Exception: pass
+        time.sleep(600)
 
 # ---------- accès ----------
 def authed(f):
@@ -526,11 +624,12 @@ def home():
 @app.route("/publier")
 @authed
 def publier():
-    cid = active(); sem = None
+    cid = active(); sem = stk = None
     if cid:
-        try: sem = cache(("h", cid), 20, lambda: donnees_chaine(cid))["sem"]
+        try:
+            d = cache(("h", cid), 20, lambda: donnees_chaine(cid)); sem, stk = d["sem"], d["stock"]
         except Exception: pass
-    return vue("publier", c=config(cid) if cid else {"max_jour": 4}, sem=sem)
+    return vue("publier", c=config(cid) if cid else {"max_jour": 4}, sem=sem, stk=stk)
 
 @app.route("/connect")
 @authed
@@ -656,6 +755,34 @@ def stats():
                heures=top(lambda x: [f"{heure_de(x)}h"]), titres=top(lambda x: [x["titre"]]),
                tags=top(hashtags_de))
 
+@app.route("/notif/test", methods=["POST"])
+@authed
+def notif_test():
+    res = notifier("Test ytauto", "Si tu lis ça, les notifications marchent.", active())
+    txt = " · ".join(f"{n} : " + ("envoyé" if ok else "échec, " + e) for n, ok, e in res) or "Aucun moyen de notification configuré (voir les variables sur Render)."
+    return redirect("/reglages?msg=" + urllib.parse.quote(txt))
+
+@app.route("/notif/bilan", methods=["POST"])
+@authed
+def notif_bilan():
+    cid = active()
+    try:
+        yt = yt_for(cid); hist = historique(yt); cfg = config(cid)
+        nom = next((n for c, n in liste() if c == cid), "")
+        res = notifier(f"Bilan de la semaine — {nom}", bilan_texte(cid, nom, yt, hist, cfg), cid)
+        txt = " · ".join(f"{n} : " + ("envoyé" if ok else "échec, " + e) for n, ok, e in res) or "Aucun moyen de notification configuré."
+    except Exception as e:
+        txt = "Impossible de préparer le bilan : " + str(e)[:150]
+    return redirect("/reglages?msg=" + urllib.parse.quote(txt))
+
+@app.route("/cron")
+def cron():
+    k = os.environ.get("CRON_KEY", "")
+    if not k or not hmac.compare_digest(request.args.get("key", ""), k): return "non", 403
+    try: verifier()
+    except Exception as e: return f"erreur : {e}", 500
+    return "ok"
+
 @app.route("/reglages", methods=["GET", "POST"])
 @authed
 def reglages():
@@ -672,7 +799,7 @@ def reglages():
                        "apprentissage": bool(f.get("apprentissage"))}
         sauver(cid, d)
         return redirect("/reglages?msg=Réglages enregistrés.")
-    return vue("reglages", c=config(cid))
+    return vue("reglages", c=config(cid), notif=moyens())
 
 PAGE = """{% macro semaine(sem, mx) %}<div class="g wk"><h3>LES 7 PROCHAINS JOURS <em>{{mx}} / jour</em></h3><div class="wd">{% for s in sem %}<div class="dy {{'td' if loop.first}}"><small>{{s.lab}}</small><b>{{s.jour.day}}</b><i class="dots">{% for x in range(mx) %}<u class="{{'f' if x<s.n}}"></u>{% endfor %}</i>{% for h in s.heures %}<span>{{h}}</span>{% endfor %}</div>{% endfor %}</div></div>{% endmacro %}
 <!doctype html><html lang="fr"><head><meta charset="utf-8">
@@ -765,13 +892,16 @@ table{width:100%;border-collapse:separate;border-spacing:0;border-radius:20px;ov
 <div class="chs">{% for d in data %}<div class="g"><div class="cch"><img src="{{d.img}}" alt=""><div><b>{{d.nom}}</b><br><span class="mut">{{d.abos}} abonnés · {{d.vues|k}} vues au total</span></div>
 <svg class="rg" viewBox="0 0 54 54"><circle cx="27" cy="27" r="22" fill="none" stroke="rgba(255,255,255,.15)" stroke-width="5"/><circle cx="27" cy="27" r="22" fill="none" stroke="#ff5a36" stroke-width="5" stroke-linecap="round" stroke-dasharray="138.2" stroke-dashoffset="{{(138.2*(1-([d.aujourd/d.max,1]|min)))|round(1)}}" transform="rotate(-90 27 27)"/><text x="27" y="32" text-anchor="middle" fill="#fff" font-size="15" font-weight="700">{{d.aujourd}}</text></svg></div>
 <div class="mini"><div class="g"><span>AUJOURD’HUI</span><b>{{d.aujourd}}<small>/{{d.max}}</small></b></div><div class="g"><span>PROGRAMMÉES</span><b>{{d.prog}}</b></div><div class="g"><span>VUES 28 J</span><b>{{d.vues28|k if d.vues28 is not none else '–'}}</b></div></div></div>{% endfor %}</div>
-<div class="wid"><div class="g"><h3>PROCHAINE PUBLICATION</h3>{% if nxt %}<div class="nx"><div class="nr" id="nr" data-iso="{{nxt[0].iso}}"><svg viewBox="0 0 110 110"><circle cx="55" cy="55" r="48" fill="none" stroke="rgba(255,255,255,.14)" stroke-width="8"/><circle id="nrc" cx="55" cy="55" r="48" fill="none" stroke="#ff5a36" stroke-width="8" stroke-linecap="round" stroke-dasharray="301.6" stroke-dashoffset="301.6" transform="rotate(-90 55 55)"/></svg><div><span id="nt">--:--</span><small>h:min</small></div></div>
+<div class="wid"><div class="g"><h3>STOCK DE VIDÉOS</h3>{% for d in data %}<div class="pb"><div class="pt"><span>{{d.nom}}</span><b>{{d.stock.videos}} vidéos</b></div><div class="tr"><i style="width:{{[d.stock.jours/7*100,100]|min}}%"></i></div>
+<small class="mut">{% if d.stock.videos %}De quoi tenir {{d.stock.jours}} jour(s) · jusqu’au {{d.stock.dernier.strftime('%d/%m')}}{% else %}Plus aucune vidéo programmée : ajoutes-en !{% endif %}</small></div>{% endfor %}</div>
+<div class="g"><h3>PROCHAINE PUBLICATION</h3>{% if nxt %}<div class="nx"><div class="nr" id="nr" data-iso="{{nxt[0].iso}}"><svg viewBox="0 0 110 110"><circle cx="55" cy="55" r="48" fill="none" stroke="rgba(255,255,255,.14)" stroke-width="8"/><circle id="nrc" cx="55" cy="55" r="48" fill="none" stroke="#ff5a36" stroke-width="8" stroke-linecap="round" stroke-dasharray="301.6" stroke-dashoffset="301.6" transform="rotate(-90 55 55)"/></svg><div><span id="nt">--:--</span><small>h:min</small></div></div>
 <div><b>{{nxt[0].titre[:40]}}</b><br><span class="mut">{{nxt[1]}}<br>{{nxt[0].jour}} à {{nxt[0].quand.strftime('%H:%M')}}</span></div></div>{% else %}<p>Aucune vidéo programmée.</p>{% endif %}</div>
 <div class="g"><h3>ACTIVITÉ</h3>{% for j in act %}<div class="it"><span class="dot {{'pub' if j.etat=='ok' else 'prog'}}"></span><div>{{(j.titre or j.nom)[:42]}}<br><span class="mut">{{ {'ok':'Programmée','erreur':'Erreur','envoi':'Envoi en cours','attente':'En attente'}[j.etat] }}{% if j.quand %} · {{j.quand}}{% endif %}</span></div></div>{% else %}<p>Aucune activité récente.</p>{% endfor %}</div>
 <div class="g"><h3>OBJECTIFS</h3>{% if acc %}<div class="pb"><div class="pt"><span>Monétisation : abonnés</span><b>{{acc.abos}} / 1000</b></div><div class="tr"><i style="width:{{[acc.abos/10,100]|min}}%"></i></div></div><p style="font-size:.8rem"><a href="/stats">Voir toute la progression</a></p>{% endif %}</div></div>
 {% if acc %}{{semaine(acc.sem,acc.max)}}{% endif %}
 {% elif view=='publier' %}
 <h1>Dépose tes vidéos.</h1><p>Tu peux en choisir plusieurs. Maximum {{c.max_jour}} par jour, publiées 5 min avant les heures de pointe. Le jour suivant se remplit tout seul.</p>
+{% if stk %}<div class="g stk"><b>Stock : {{stk.videos}} vidéo(s)</b> · {% if stk.videos %}de quoi tenir {{stk.jours}} jour(s), jusqu’au {{stk.dernier.strftime('%d/%m')}}{% else %}plus rien de programmé : ajoutes-en !{% endif %}</div>{% endif %}
 <form id="fm" method="post" action="/upload" enctype="multipart/form-data">
 <label class="drop" id="dz" for="vf"><svg viewBox="0 0 24 24">{{ICONS['upload']|safe}}</svg><b>Dépose tes vidéos ici</b><span>ou touche pour les choisir : titre, hashtags et horaire sont choisis tout seuls</span><em id="nf"></em></label>
 <input id="vf" name="video" type="file" accept="video/*" multiple hidden>
@@ -885,6 +1015,10 @@ load();setInterval(load,3000);
 <label>Image de fond (lien, facultatif)</label><input name="fond" value="{{c.fond}}" placeholder="https://…">
 <label class="chk"><input type="checkbox" name="apprentissage" {{'checked' if c.apprentissage}}> Apprendre de mes résultats</label>
 <button>Enregistrer</button></form>
+<h2>Notifications</h2><div class="g box"><p>Moyens actifs : {{notif|join(', ') if notif else 'aucun (voir les variables sur Render)'}}.</p>
+<p style="font-size:.85rem">Alerte quand le stock est bas, et bilan de la semaine chaque vendredi dès 18h.</p>
+<form method="post" action="/notif/test"><button type="submit">Envoyer une notification de test</button></form>
+<form method="post" action="/notif/bilan"><button type="submit">Envoyer le bilan de la semaine maintenant</button></form></div>
 {% endif %}{% endif %}
 </main>{% if view!='login' %}<script>
 (function(){var $=function(i){return document.getElementById(i)};function p2(n){return(n<10?'0':'')+n}
@@ -896,3 +1030,5 @@ var nr=$('nr');if(nr){var rem=new Date(nr.dataset.iso)-d;if(rem<0)rem=0;var mn=M
 if($('ck')){var t='';for(var i=0;i<60;i++){var a=i*6*Math.PI/180,l=i%5?4:9;t+='<line x1="'+(100+Math.sin(a)*(90-l))+'" y1="'+(100-Math.cos(a)*(90-l))+'" x2="'+(100+Math.sin(a)*90)+'" y2="'+(100-Math.cos(a)*90)+'" stroke="rgba(255,255,255,'+(i%5?.35:.9)+')" stroke-width="'+(i%5?1:2.4)+'"/>'}$('ck').insertAdjacentHTML('afterbegin',t)}
 tick();setInterval(tick,1000)})();
 </script>{% endif %}</body></html>"""
+
+threading.Thread(target=boucle, daemon=True).start()
