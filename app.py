@@ -19,6 +19,8 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
           "https://www.googleapis.com/auth/youtube.readonly"]
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 os.makedirs(DATA + "/chaines", exist_ok=True)
+DEFAUT_TAGS = ["#asmr", "#shorts", "#asmrshorts", "#asmrman", "#fyp", "#satisfying", "#relax", "#relaxation",
+               "#whispering", "#chuchotement", "#visualasmr", "#satisfyingvideo", "#frissonsgarantis", "#dormir", "#detente"]
 MIN_APPRENTISSAGE = 8  # en dessous : on explore au hasard
 
 # ---------- chaînes (une par fichier) ----------
@@ -38,10 +40,10 @@ def active():
 
 def _env(k): return [x.strip() for x in os.environ.get(k, "").split("|") if x.strip()]
 def config(cid):
-    c = {"titres": _env("TITRES"), "fixes": _env("HASHTAGS"), "pool": _env("HASHTAGS_TEST"),
-         "par_video": 8, "heures": [12, 18, 20], "apprentissage": True,
-         "desc": "ASMR relaxant pour dormir et se détendre"}
+    c = {"titres": _env("TITRES"), "fixes": DEFAUT_TAGS, "pool": _env("HASHTAGS_TEST"),
+         "par_video": 8, "heures": [12, 18, 20], "apprentissage": True}
     c.update((charger(cid) or {}).get("config", {}))
+    if not c["fixes"]: c["fixes"] = DEFAUT_TAGS
     return c
 
 def yt_for(cid):
@@ -206,10 +208,9 @@ def upload():
     cid = active()
     if not cid: return redirect("/connect")
     yt, cfg = yt_for(cid), config(cid)
-    desc = request.form.get("desc", "").strip() or cfg["desc"]
     titre, tags, when, appr = choisir(historique(yt), cfg)
-    titre = request.form.get("title", "").strip() or titre or titre_ia(desc)
-    texte = desc + ("\n\n" + " ".join(tags) if tags else "") + ("\n#Shorts" if request.form.get("short") else "")
+    titre = request.form.get("title", "").strip() or titre or titre_ia("ASMR relaxant")
+    texte = " ".join(tags)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     request.files["video"].save(tmp.name)
     body = {"snippet": {"title": titre[:100], "description": texte, "categoryId": "22"},
@@ -277,8 +278,7 @@ def reglages():
                        "fixes": sp(f["fixes"]), "pool": sp(f["pool"]),
                        "par_video": int(f.get("par_video") or 8),
                        "heures": [int(x) for x in sp(f["heures"]) if x.isdigit() and int(x) < 24] or [18],
-                       "apprentissage": bool(f.get("apprentissage")),
-                       "desc": f.get("desc", "").strip() or "ASMR relaxant"}
+                       "apprentissage": bool(f.get("apprentissage"))}
         sauver(cid, d)
         return redirect("/reglages?msg=Réglages enregistrés.")
     return vue("reglages", c=config(cid))
@@ -339,12 +339,10 @@ table{width:100%;border-collapse:separate;border-spacing:0;border-radius:16px;ov
 {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
 {% if not cid %}<h1>Connecte ta chaîne YouTube</h1><a class="btn" href="/connect">Connecter ma chaîne</a>
 {% elif view=='publier' %}
-<h1>Dépose ta vidéo.</h1><p>Titre, hashtags et heure sont choisis pour toi d’après tes résultats.</p>
+<h1>Dépose ta vidéo.</h1><p>Titre et heure sont choisis pour toi. Les 15 hashtags sont ajoutés en description.</p>
 <form id="fm" method="post" action="/upload" enctype="multipart/form-data">
 <label>Vidéo ou Short</label><input type="file" name="video" accept="video/*" required>
 <label>Titre (vide = choisi pour toi)</label><input name="title">
-<label>Description (vide = celle des Réglages)</label><textarea name="desc"></textarea>
-<label class="chk"><input type="checkbox" name="short" value="1"> C’est un Short</label>
 <div class="bar" id="bar"><i></i></div><p id="wt"></p><button id="bt">Programmer</button></form>
 <script>
 fm.addEventListener('submit',function(e){e.preventDefault();var x=new XMLHttpRequest();x.open('POST','/upload');
@@ -380,9 +378,8 @@ var t=document.querySelector('.today')||document.querySelector('.d:not(.out)');i
 <h2>Top vidéos</h2><table>{% for v in meilleures %}<tr><td>{{v.titre}}</td><td>{{v.vues}} vues</td></tr>{% endfor %}</table>
 {% elif view=='reglages' %}
 <h1>Réglages</h1><form method="post">
-<label>Description par défaut (utilisée si tu n’en écris pas)</label><textarea name="desc">{{c.desc}}</textarea>
 <label>Tes titres (un par ligne)</label><textarea name="titres">{{c.titres|join('\n')}}</textarea>
-<label>Hashtags fixes (séparés par des virgules)</label><input name="fixes" value="{{c.fixes|join(', ')}}">
+<label>Hashtags en description de chaque vidéo (séparés par des virgules)</label><input name="fixes" value="{{c.fixes|join(', ')}}">
 <label>Hashtags à tester</label><textarea name="pool">{{c.pool|join(', ')}}</textarea>
 <label>Hashtags par vidéo</label><input name="par_video" type="number" value="{{c.par_video}}">
 <label>Heures de publication possibles (ex : 12, 18, 20)</label><input name="heures" value="{{c.heures|join(', ')}}">
