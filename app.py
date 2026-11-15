@@ -28,6 +28,8 @@ EXTRA_TAGS = ["#asmrsleep", "#asmrtriggers", "#asmrsounds", "#tingles", "#relaxi
               "#brainmelt", "#asmrnomusic", "#calm", "#sleepaid", "#asmrlover", "#satisfyingsounds", "#crunchy",
               "#mouthsounds", "#asmrmic", "#tapping", "#relaxingsounds", "#stressrelief", "#chill", "#asmrfood", "#slime"]
 NB_TAGS = 15
+DEFAUT_HEURES = [12, 13, 18, 19, 20, 21, 22]
+AVANCE_MIN = 5  # on publie 5 min avant l'heure de pointe
 MIN_APPRENTISSAGE = 8  # en dessous : on explore au hasard
 
 # ---------- chaînes (une par fichier) ----------
@@ -48,7 +50,7 @@ def active():
 def _env(k): return [x.strip() for x in os.environ.get(k, "").split("|") if x.strip()]
 def config(cid):
     c = {"titres": _env("TITRES"), "oblig": OBLIG_TAGS, "pool": _env("HASHTAGS_TEST"),
-         "heures": [12, 18, 20], "apprentissage": True}
+         "heures": DEFAUT_HEURES, "max_jour": 4, "apprentissage": True}
     c.update((charger(cid) or {}).get("config", {}))
     if not c["oblig"]: c["oblig"] = OBLIG_TAGS
     return c
@@ -114,9 +116,34 @@ def tirages(bras, st, m0, s0):
         return random.gauss((n * m + m0) / (n + 1), s0 / math.sqrt(n + 1))
     return sorted(bras, key=t, reverse=True)
 
+def heure_de(v):
+    """Heure de pointe visée (une vidéo publiée à 17h55 compte pour 18h)."""
+    return (v["pub"].astimezone(TZ) + timedelta(minutes=30)).hour
+
+def occupation(hist):
+    occ = {}
+    for v in hist:
+        occ.setdefault(v["pub"].astimezone(TZ).date(), []).append(heure_de(v))
+    return occ
+
+def prochain_creneau(occ, ranked, cap):
+    """Premier jour qui a encore de la place (max `cap` par jour), à l'heure de pointe la mieux classée moins 5 min."""
+    now = datetime.now(TZ)
+    for d in range(0, 40):
+        jour = (now + timedelta(days=d)).date()
+        pris = occ.get(jour, [])
+        if len(pris) >= cap: continue
+        for h in ranked:
+            if h in pris: continue
+            t = datetime(jour.year, jour.month, jour.day, h, 0, tzinfo=TZ) - timedelta(minutes=AVANCE_MIN)
+            if t >= now + timedelta(minutes=20):
+                occ.setdefault(jour, []).append(h)
+                return t
+    return (now + timedelta(days=1)).replace(hour=17, minute=55, second=0, microsecond=0)
+
 def hashtags_de(v): return [h.lower() for h in re.findall(r"#\w+", v["desc"])]
 
-def choisir(hist, cfg):
+def choisir(hist, cfg, occ=None):
     vids = mesurees(hist)
     appr = cfg["apprentissage"] and len(vids) >= MIN_APPRENTISSAGE
     m0, s0 = globales(vids)
@@ -139,16 +166,10 @@ def choisir(hist, cfg):
         reste = [h for h in cand if h not in base]
         random.shuffle(reste)
         pris_tags = (base + reste)[:n]
-    heures = tirages(cfg["heures"], stats_par(vids, lambda v: [v["pub"].astimezone(TZ).hour]), m0, s0) if appr \
-        else random.sample(cfg["heures"], len(cfg["heures"]))
-    pris = {v["pub"].astimezone(TZ).date() for v in hist if v["pub"] > datetime.now(timezone.utc)}
-    now = datetime.now(TZ)
-    quand = None
-    for d in range(0, 15):
-        t = (now + timedelta(days=d)).replace(hour=int(heures[0]), minute=0, second=0, microsecond=0)
-        if t >= now + timedelta(hours=1) and t.date() not in pris:
-            quand = t; break
-    quand = quand or (now + timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+    cand_h = list(dict.fromkeys([int(h) for h in cfg["heures"]] + DEFAUT_HEURES))
+    if appr: ranked = tirages(cand_h, stats_par(vids, lambda v: [heure_de(v)]), m0, s0)
+    else: ranked = random.sample(cand_h, len(cand_h))
+    quand = prochain_creneau(occupation(hist) if occ is None else occ, ranked, int(cfg["max_jour"]))
     return titre, oblig + pris_tags, quand.astimezone(timezone.utc), appr
 
 def gemini(prompt):
@@ -233,7 +254,7 @@ def canal(cid):
 @app.route("/")
 @authed
 def home():
-    return vue("publier")
+    return vue("publier", c=config(active()) if active() else {"max_jour": 4})
 
 @app.route("/connect")
 @authed
@@ -264,26 +285,32 @@ def upload():
     if not cid: return redirect("/connect")
     yt, cfg = yt_for(cid), config(cid)
     hist = historique(yt)
-    titre, tags, when, appr = choisir(hist, cfg)
-    saisi = request.form.get("title", "").strip()
-    inspire = None if saisi else titre_inspire(hist)
-    source = ("écrit par toi" if saisi else "inspiré de tes meilleurs titres" if inspire
-              else "tiré de ta liste" if titre else "IA")
-    titre = saisi or inspire or titre or titre_ia("ASMR relaxant")
-    texte = " ".join(tags)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    request.files["video"].save(tmp.name)
-    body = {"snippet": {"title": titre[:100], "description": texte, "categoryId": "22"},
-            "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False,
-                       "publishAt": when.strftime("%Y-%m-%dT%H:%M:%S.000Z")}}
-    req = yt.videos().insert(part="snippet,status", body=body,
-                             media_body=MediaFileUpload(tmp.name, chunksize=8 * 1024 * 1024, resumable=True))
-    resp = None
-    while resp is None:
-        _, resp = req.next_chunk()
-    os.unlink(tmp.name)
-    mode = f"titre {source} · hashtags " + ("optimisés" if appr else "en test")
-    return redirect(f"/?msg=Programmée le {when.astimezone(TZ):%d/%m à %Hh} — « {titre} » ({mode})")
+    occ = occupation(hist)
+    fichiers = [f for f in request.files.getlist("video") if f.filename]
+    saisi = request.form.get("title", "").strip() if len(fichiers) == 1 else ""
+    faits, modes = [], set()
+    for f in fichiers:
+        titre, tags, when, appr = choisir(hist, cfg, occ)
+        inspire = None if saisi else titre_inspire(hist)
+        modes.add("écrit par toi" if saisi else "inspiré de tes meilleurs titres" if inspire
+                  else "tiré de ta liste" if titre else "IA")
+        titre = saisi or inspire or titre or titre_ia("ASMR relaxant")
+        texte = " ".join(tags)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        f.save(tmp.name)
+        body = {"snippet": {"title": titre[:100], "description": texte, "categoryId": "22"},
+                "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False,
+                           "publishAt": when.strftime("%Y-%m-%dT%H:%M:%S.000Z")}}
+        req = yt.videos().insert(part="snippet,status", body=body,
+                                 media_body=MediaFileUpload(tmp.name, chunksize=8 * 1024 * 1024, resumable=True))
+        resp = None
+        while resp is None:
+            _, resp = req.next_chunk()
+        os.unlink(tmp.name)
+        hist.insert(0, dict(id="", titre=titre, desc=texte, pub=when, vues=0, likes=0, statut="private", img=""))
+        faits.append(f"{when.astimezone(TZ):%d/%m à %Hh%M}")
+    mode = " / ".join(sorted(modes)) + " · hashtags " + ("optimisés" if appr else "en test")
+    return redirect(f"/?msg={len(faits)} vidéo(s) programmée(s) : " + " · ".join(faits) + f" ({mode})")
 
 @app.route("/calendrier")
 @authed
@@ -325,7 +352,7 @@ def stats():
     try: an = analytique(cid, yt, j)
     except Exception as e: err = str(e)[:260]
     return vue("stats", j=j, an=an, err=err, nm=len(v), mini=MIN_APPRENTISSAGE,
-               heures=top(lambda x: [f"{x['pub'].astimezone(TZ).hour}h"]), titres=top(lambda x: [x["titre"]]),
+               heures=top(lambda x: [f"{heure_de(x)}h"]), titres=top(lambda x: [x["titre"]]),
                tags=top(hashtags_de))
 
 @app.route("/reglages", methods=["GET", "POST"])
@@ -339,7 +366,8 @@ def reglages():
         d = charger(cid)
         d["config"] = {"titres": [x.strip() for x in f["titres"].splitlines() if x.strip()],
                        "oblig": sp(f["oblig"]) or OBLIG_TAGS, "pool": sp(f["pool"]),
-                       "heures": [int(x) for x in sp(f["heures"]) if x.isdigit() and int(x) < 24] or [18],
+                       "heures": [int(x) for x in sp(f["heures"]) if x.isdigit() and int(x) < 24] or DEFAUT_HEURES,
+                       "max_jour": max(1, min(10, int(f.get("max_jour") or 4))),
                        "apprentissage": bool(f.get("apprentissage"))}
         sauver(cid, d)
         return redirect("/reglages?msg=Réglages enregistrés.")
@@ -407,10 +435,10 @@ table{width:100%;border-collapse:separate;border-spacing:0;border-radius:16px;ov
 {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
 {% if not cid %}<h1>Connecte ta chaîne YouTube</h1><a class="btn" href="/connect">Connecter ma chaîne</a>
 {% elif view=='publier' %}
-<h1>Dépose ta vidéo.</h1><p>Titre et heure sont choisis pour toi. Les 15 hashtags sont ajoutés en description.</p>
+<h1>Dépose tes vidéos.</h1><p>Tu peux en choisir plusieurs. Maximum {{c.max_jour}} par jour, publiées 5 min avant les heures de pointe. Le jour suivant se remplit tout seul.</p>
 <form id="fm" method="post" action="/upload" enctype="multipart/form-data">
-<label>Vidéo ou Short</label><input type="file" name="video" accept="video/*" required>
-<label>Titre (vide = choisi pour toi)</label><input name="title">
+<label>Vidéos ou Shorts</label><input type="file" name="video" accept="video/*" multiple required>
+<label>Titre (vide = choisi pour toi ; ignoré si tu envoies plusieurs vidéos)</label><input name="title">
 <div class="bar" id="bar"><i></i></div><p id="wt"></p><button id="bt">Programmer</button></form>
 <script>
 fm.addEventListener('submit',function(e){e.preventDefault();var x=new XMLHttpRequest();x.open('POST','/upload');
@@ -473,7 +501,8 @@ svg.addEventListener('pointermove',mv);svg.addEventListener('pointerdown',mv)}
 <label>Tes titres (un par ligne)</label><textarea name="titres">{{c.titres|join('\n')}}</textarea>
 <label>Hashtags obligatoires (toujours en description)</label><input name="oblig" value="{{c.oblig|join(', ')}}">
 <label>Hashtags candidats en plus (le site choisit les meilleurs parmi eux, 15 par vidéo)</label><textarea name="pool">{{c.pool|join(', ')}}</textarea>
-<label>Heures de publication possibles (ex : 12, 18, 20)</label><input name="heures" value="{{c.heures|join(', ')}}">
+<label>Heures de pointe (YouTube Studio, onglet Audience). Publication 5 min avant.</label><input name="heures" value="{{c.heures|join(', ')}}">
+<label>Vidéos maximum par jour</label><input name="max_jour" type="number" min="1" max="10" value="{{c.max_jour}}">
 <label class="chk"><input type="checkbox" name="apprentissage" {{'checked' if c.apprentissage}}> Apprendre de mes résultats</label>
 <button>Enregistrer</button></form>
 {% endif %}{% endif %}
