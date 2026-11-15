@@ -344,14 +344,15 @@ def analyser(hist, ret, seuil):
     for v in hist:
         age = (now - v["pub"]).total_seconds() / 86400
         if v["statut"] != "public" or age < 2: continue
-        rows.append(dict(v, vpj=v["vues"] / age, age=age, nb_tags=len(hashtags_de(v)), long_t=len(v["titre"]),
+        rows.append(dict(v, vpj=v["vues"] / min(age, 7), age=age, nb_tags=len(hashtags_de(v)), long_t=len(v["titre"]),
                          q="?" in v["titre"], asmr="asmr" in v["titre"].lower(),
                          jlike=v["likes"] / max(v["vues"], 1) * 100, ret=ret.get(v["id"], {}).get("ret"),
                          h=heure_de(v)))
     if len(rows) < 4: return None
-    bas = sorted([r for r in rows if r["vpj"] < seuil], key=lambda r: r["vpj"])
     bons = [r for r in rows if r["vpj"] >= seuil]
-    if len(bons) < 3: bons = sorted(rows, key=lambda r: -r["vpj"])[:max(3, len(rows) // 4)]
+    ref_seuil = len(bons) >= 3
+    if not ref_seuil: bons = sorted(rows, key=lambda r: -r["vpj"])[:max(3, len(rows) // 4)]
+    bas = sorted([r for r in rows if r["vpj"] < seuil and r not in bons], key=lambda r: r["vpj"])
     ref_bas = bas or [r for r in rows if r not in bons]
     med = lambda g, k: statistics.median([r[k] for r in g if r[k] is not None] or [0]) if any(r[k] is not None for r in g) else None
     part = lambda g, k: sum(1 for r in g if r[k]) / max(len(g), 1)
@@ -398,7 +399,7 @@ def analyser(hist, ret, seuil):
     if tags_mauv: cs.append("À retirer : " + " ".join(h for h, _, _ in tags_mauv) + ".")
     if tags_bons: cs.append("À garder : " + " ".join(h for h, _, _ in tags_bons) + ".")
     if hs: cs.append("Tes meilleures heures : " + ", ".join(f"{h}h" for h, _, _ in hs[:3]) + ".")
-    return dict(n=len(rows), nb_bons=len(rows) - len(bas), bas=bas[:30], comp=comp, conseils=cs, tags_bons=tags_bons,
+    return dict(n=len(rows), nb_bons=sum(1 for r in rows if r["vpj"] >= seuil), ref_seuil=ref_seuil, nb_ref=len(bons), bas=bas[:30], comp=comp, conseils=cs, tags_bons=tags_bons,
                 tags_mauv=tags_mauv, heures=hs, top=sorted(rows, key=lambda r: -r["vpj"])[:8])
 
 CACHE, BADGE = {}, {}
@@ -426,6 +427,27 @@ def cache(cle, ttl, fn):
     if v is not None and time.time() - t < ttl: return v
     v = fn(); CACHE[cle] = (time.time(), v); return v
 
+@app.after_request
+def pas_de_cache(r):
+    if r.mimetype == "text/html": r.headers["Cache-Control"] = "no-store"
+    return r
+
+def recent(cid, yt):
+    """Vues arrivées depuis le dernier jour confirmé par YouTube Analytics (estimation : Analytics a 2 à 3 jours de retard)."""
+    ya = build("youtubeAnalytics", "v2", credentials=creds_for(cid))
+    ch = yt.channels().list(part="snippet,statistics", mine=True).execute()["items"][0]
+    debut, live = ch["snippet"]["publishedAt"][:10], int(ch["statistics"].get("viewCount", 0))
+    fin = datetime.now(TZ).date()
+    q = lambda d0, **k: ya.reports().query(ids="channel==MINE", startDate=d0, endDate=str(fin), **k).execute().get("rows", [])
+    jours = q(str(fin - timedelta(days=10)), metrics="views", dimensions="day", sort="day")
+    total = q(debut, metrics="views")
+    if not jours or not total: return None
+    d = datetime.fromisoformat(jours[-1][0]).date(); lag = max(0, (fin - d).days)
+    moy = sum(r[1] for r in jours[-7:]) / len(jours[-7:])
+    est = max(0, live - total[0][0])
+    if est > moy * (lag + 2) * 3 + 200: return None  # écart trop grand : les deux compteurs ne se comparent pas
+    return dict(dernier=d.strftime("%d/%m"), jours=lag, est=est)
+
 def vues_28j(cid):
     ya = build("youtubeAnalytics", "v2", credentials=creds_for(cid))
     fin = datetime.now(TZ).date()
@@ -443,6 +465,10 @@ def donnees_chaine(cid):
     futur = sorted((v for v in hist if v["pub"] > now), key=lambda v: v["pub"])
     try: v28 = vues_28j(cid)
     except Exception: v28 = None
+    try:
+        r = recent(cid, yt)
+        if v28 is not None and r: v28 += r["est"]
+    except Exception: pass
     def jour_txt(d): return "aujourd’hui" if d == aujourd else "demain" if d == aujourd + timedelta(days=1) else f"{d:%d/%m}"
     sem = []
     for i in range(7):
@@ -487,9 +513,10 @@ def canal(cid):
 @app.route("/")
 @authed
 def home():
+    if request.args.get("maj"): CACHE.clear()
     data = []
     for c, _ in liste():
-        try: data.append(cache(("h", c), 60, lambda c=c: donnees_chaine(c)))
+        try: data.append(cache(("h", c), 20, lambda c=c: donnees_chaine(c)))
         except Exception: pass
     prog = sorted(((f, d["nom"]) for d in data for f in d["futur"]), key=lambda x: x[0]["quand"])
     acc = next((d for d in data if d["cid"] == active()), data[0] if data else None)
@@ -501,7 +528,7 @@ def home():
 def publier():
     cid = active(); sem = None
     if cid:
-        try: sem = cache(("h", cid), 60, lambda: donnees_chaine(cid))["sem"]
+        try: sem = cache(("h", cid), 20, lambda: donnees_chaine(cid))["sem"]
         except Exception: pass
     return vue("publier", c=config(cid) if cid else {"max_jour": 4}, sem=sem)
 
@@ -551,6 +578,12 @@ def upload():
 def file():
     return vue("file")
 
+@app.route("/file/vider", methods=["POST"])
+@authed
+def file_vider():
+    JOBS[:] = [j for j in JOBS if j["etat"] in ("attente", "envoi")]
+    return jsonify(ok=True)
+
 @app.route("/file.json")
 @authed
 def file_json():
@@ -562,7 +595,9 @@ def diagnostic():
     cid = active()
     if not cid: return redirect("/")
     seuil = int(request.args.get("seuil", 1500))
-    d = analyser(historique(yt_for(cid)), retention(cid), seuil)
+    d = perr = None
+    try: d = analyser(historique(yt_for(cid)), retention(cid), seuil)
+    except Exception as e: perr = str(e)[:300]
     ia = err = None
     if d and request.args.get("ia"):
         L = lambda r: (f"- «{r['titre']}» | {r['vpj']:.0f} vues/j | {r['duree']} s | rétention {r['ret'] if r['ret'] is not None else '?'} % | "
@@ -572,7 +607,7 @@ def diagnostic():
              + "\n\nAnalyse en profondeur pourquoi les moins bonnes n'ont pas percé et donne 8 actions concrètes et précises "
                "(titre, hashtags, durée, accroche des premières secondes, son, miniature, heure, format). Réponds en français, texte simple, sans markdown.")
         ia, err = gemini(p)
-    return vue("diag", d=d, seuil=seuil, ia=ia, err=err)
+    return vue("diag", d=d, seuil=seuil, ia=ia, err=err, perr=perr)
 
 @app.route("/calendrier")
 @authed
@@ -615,7 +650,9 @@ def stats():
     except Exception as e: err = str(e)[:260]
     try: mon = barres(monetisation(cid, yt))
     except Exception: pass
-    return vue("stats", j=j, an=an, err=err, mon=mon, nm=len(v), mini=MIN_APPRENTISSAGE,
+    try: fr = recent(cid, yt)
+    except Exception: fr = None
+    return vue("stats", j=j, an=an, err=err, mon=mon, fr=fr, maj=datetime.now(TZ).strftime("%H:%M"), nm=len(v), mini=MIN_APPRENTISSAGE,
                heures=top(lambda x: [f"{heure_de(x)}h"]), titres=top(lambda x: [x["titre"]]),
                tags=top(hashtags_de))
 
@@ -711,7 +748,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;border-radius:20px;ov
 {% else %}
 <header class="top"><a class="logo" href="/"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="#fff"/></svg></a><b class="st">Studio</b>
 <div class="pills">{% for i,n in chaines %}<a class="pill {{'on' if i==cid}}" href="/canal/{{i}}?retour={{request.path}}">{{n}}{% if BADGE.get(i) %}<em>{{BADGE[i]}}</em>{% endif %}</a>{% endfor %}<a class="pill" href="/connect">+ Chaîne</a></div>
-<span class="sp"></span><span class="ok"><i></i>Connecté</span><span id="tb" class="tb"></span></header>
+<a class="pill" href="?maj=1">↻ Actualiser</a><span class="sp"></span><span class="ok"><i></i>Connecté</span><span id="tb" class="tb"></span></header>
 <nav class="dock">{% for k,l,u,i in [('home','Accueil','/','home'),('publier','Publier','/publier','upload'),('stats','Stats','/stats','chart'),('cal','Agenda','/calendrier','cal'),('biblio','Vidéos','/bibliotheque','grid'),('diag','Analyse','/diagnostic','search'),('file','File','/file','list'),('reglages','Réglages','/reglages','sliders')] %}<a class="{{'on' if view==k}}" href="{{u}}"><svg viewBox="0 0 24 24">{{ICONS[i]|safe}}</svg><span>{{l}}</span></a>{% endfor %}</nav>
 {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
 {% if not cid %}<h1>Connecte ta chaîne YouTube</h1><a class="btn" href="/connect">Connecter ma chaîne</a>
@@ -770,6 +807,7 @@ var t=document.querySelector('.today')||document.querySelector('.d:not(.out)');i
 <span class="mut">{{v.vues}} vues · {{v.likes}} j’aime<br>{{'Programmée' if v.pub>now else v.statut}} · {{v.pub.astimezone(tz).strftime('%d/%m %Hh')}}</span></div></div>{% endfor %}</div>
 {% elif view=='stats' %}
 <div class="ch"><h1>Stats</h1><div>{% for d in [7,28,90] %}<a class="{{'on' if j==d}}" href="/stats?j={{d}}">{{d}} j</a>{% endfor %}</div></div>
+{% if fr %}<div class="msg">Dernier jour confirmé par YouTube : <b>{{fr.dernier}}</b>{% if fr.jours>0 %} ({{fr.jours}} j de retard côté YouTube){% endif %}. Depuis, environ <b>+{{fr.est|k}} vues</b> en direct (estimation). Actualisé à {{maj}}.</div>{% else %}<p>Actualisé à {{maj}}. YouTube confirme ses chiffres détaillés avec 2 à 3 jours de retard.</p>{% endif %}
 {% if err %}<div class="msg">Les stats YouTube détaillées ne sont pas encore autorisées.<br>
 1) Dans Google Cloud, active « YouTube Analytics API ». 2) Reconnecte ta chaîne avec le bouton ci-dessous.
 <a class="btn" href="/connect">Reconnecter ma chaîne</a><p style="font-size:.75rem">{{err}}</p></div>
@@ -806,19 +844,23 @@ draw('vues');
 {% for n,v,c,p in mon %}<div class="pb"><div class="pt"><span>{{n}}</span><b>{{v}} / {{c}} · {{p}} %</b></div><div class="tr"><i style="width:{{p}}%"></i></div></div>{% endfor %}
 <p style="font-size:.8rem">Voie Shorts : 1 000 abonnés + 10 M de vues Shorts sur 90 jours. À partir du 1er février 2027, les nouveaux inscrits devront 20 M.</p></div>{% endif %}
 {% elif view=='file' %}
-<h1>File d’attente</h1><p>Garde cette page ouverte : l’envoi vers YouTube continue pendant qu’elle est ouverte.</p><div id="q"></div>
+<div class="ch"><h1>File d’attente</h1><div><a href="#" id="vd">Vider la liste</a></div></div><p>Garde cette page ouverte pendant l’envoi. « Vider la liste » enlève seulement les lignes terminées, jamais les vidéos sur YouTube.</p><div id="q"></div>
 <script>
 function esc(t){var d=document.createElement('div');d.textContent=t==null?'':t;return d.innerHTML}
 function load(){fetch('/file.json').then(function(r){return r.json()}).then(function(L){
 document.getElementById('q').innerHTML=L.map(function(j){var s={attente:'En attente',envoi:'Envoi '+j.pct+' %',ok:'Programmée',erreur:'Erreur'}[j.etat];
 return '<div class="g job"><b>'+esc(j.titre||j.nom)+'</b><div class="mut">'+s+(j.quand?' · '+esc(j.quand):'')+(j.vid?' · <a href="https://studio.youtube.com/video/'+j.vid+'/edit" target="_blank">Ouvrir dans Studio</a>':'')+'</div>'
 +(j.etat=='envoi'?'<div class="tr"><i style="width:'+j.pct+'%"></i></div>':'')+(j.warn?'<p class="err">'+esc(j.warn)+'</p>':'')+(j.msg?'<p class="err">'+esc(j.msg)+'</p>':'')+(j.ia?'<p class="mut">IA indisponible : '+esc(j.ia)+'</p>':'')+'</div>'}).join('')||'<p>Rien en cours.</p>'})}
+document.getElementById('vd').addEventListener('click',function(e){e.preventDefault();fetch('/file/vider',{method:'POST'}).then(load)});
 load();setInterval(load,3000);
 </script>
 {% elif view=='diag' %}
 <div class="ch"><h1>Diagnostic</h1><div>{% for s in [500,1500,5000] %}<a class="{{'on' if seuil==s}}" href="/diagnostic?seuil={{s}}">&lt; {{s}}/j</a>{% endfor %}</div></div>
 <p>Vidéos publiées depuis plus de 2 jours, comparées à tes meilleures. Seuil : {{seuil}} vues par jour.</p>
-{% if not d %}<div class="msg">Pas assez de vidéos publiées pour analyser (il en faut au moins 4).</div>{% else %}
+{% if perr %}<div class="msg">Impossible d’analyser pour l’instant : {{perr}}</div>
+{% elif not d %}<div class="msg">Pas assez de vidéos publiées depuis plus de 2 jours pour analyser (il en faut au moins 4).</div>{% else %}
+<p>Vues par jour = vues ÷ min(âge, 7 jours) : on regarde la première semaine, quand un Short fait l’essentiel de ses vues.</p>
+{% if not d.ref_seuil %}<div class="msg">Moins de 3 vidéos dépassent {{seuil}} vues/jour : la comparaison se fait avec tes {{d.nb_ref}} meilleures vidéos, qui ne sont pas listées ci-dessous.</div>{% endif %}
 <div class="kpi"><div class="g"><span>Sous le seuil</span><b>{{d.bas|length}}</b></div><div class="g"><span>Au-dessus</span><b>{{d.nb_bons}}</b></div><div class="g"><span>Analysées</span><b>{{d.n}}</b></div></div>
 {% for c in d.conseils %}<div class="msg">{{c}}</div>{% endfor %}
 <h2>Meilleures vidéos contre les autres</h2>
