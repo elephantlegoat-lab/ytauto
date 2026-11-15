@@ -292,7 +292,16 @@ SOURCES = {"SHORTS": "Shorts", "YT_SEARCH": "Recherche YouTube", "SUGGESTED_VIDE
 
 def analytique(cid, yt, j):
     ya = build("youtubeAnalytics", "v2", credentials=creds_for(cid))
-    fin = datetime.now(TZ).date(); deb = fin - timedelta(days=j)
+    fin = datetime.now(TZ).date()
+    try:  # on s'aligne sur le dernier jour réellement confirmé par YouTube (sinon les comparaisons sont faussées)
+        r10 = ya.reports().query(ids="channel==MINE", startDate=str(fin - timedelta(days=10)), endDate=str(fin),
+                                 metrics="views", dimensions="day", sort="day").execute().get("rows", [])
+        if r10:
+            fin = datetime.fromisoformat(r10[-1][0]).date()
+            if len(r10) >= 4 and r10[-1][1] < 0.5 * sum(r[1] for r in r10[-4:-1]) / 3:
+                fin -= timedelta(days=1)  # dernier jour encore incomplet
+    except Exception: pass
+    deb = fin - timedelta(days=j)
     q = lambda **k: ya.reports().query(ids="channel==MINE", startDate=str(deb), endDate=str(fin), **k).execute().get("rows", [])
     jour = q(metrics="views,estimatedMinutesWatched,likes,subscribersGained,subscribersLost", dimensions="day", sort="day")
     top = q(metrics="views,estimatedMinutesWatched", dimensions="video", sort="-views", maxResults=8)
@@ -310,7 +319,7 @@ def analytique(cid, yt, j):
     return dict(labels=[r[0][8:] + "/" + r[0][5:7] for r in jour], vues=S(1), heures=[round(m / 60, 2) for m in S(2)],
                 likes=S(3), abos=[a - b for a, b in zip(S(4), S(5))],
                 tot=dict(vues=sum(S(1)), heures=round(sum(S(2)) / 60, 1), likes=sum(S(3)), abos=sum(S(4)) - sum(S(5))),
-                delta=delta, top=[(noms.get(r[0], r[0]), r[1], round(r[2] / 60, 1)) for r in top],
+                delta=delta, fin=fin.strftime('%d/%m'), top=[(noms.get(r[0], r[0]), r[1], round(r[2] / 60, 1)) for r in top],
                 src=[(SOURCES.get(r[0], r[0]), r[1]) for r in src])
 
 def barres(mon):
@@ -543,9 +552,9 @@ def bilan_texte(cid, nom, yt, hist, cfg):
     s = stock(hist, cfg)
     L = [f"Bilan de la semaine — {nom}", f"Vues : {t['vues']}{fmt('vues')}", f"Heures vues : {t['heures']}{fmt('heures')}",
          f"Abonnés gagnés : {t['abos']:+d}{fmt('abos')}", f"J'aime : {t['likes']}{fmt('likes')}", f"Vidéos publiées : {posts}"]
-    if an["top"]: L.append("Top : " + " | ".join(f"{n[:30]} ({v} vues)" for n, v, h in an["top"][:3]))
+    if an["top"]: L.append("Top : " + " | ".join(f"{n if len(n) <= 38 else n[:37] + '…'} ({v} vues)" for n, v, h in an["top"][:3]))
     L.append(f"Stock restant : {s['videos']} vidéo(s), {s['jours']} jour(s)")
-    L.append("(Chiffres confirmés par YouTube, avec 2 à 3 jours de retard.)")
+    L.append(f"(7 jours jusqu’au {an['fin']}, derniers chiffres confirmés par YouTube, comparés aux 7 jours d’avant.)")
     return "\n".join(L)
 
 def lire_etat():
