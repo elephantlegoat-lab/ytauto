@@ -1,7 +1,7 @@
-import os, json, math, random, tempfile, re, calendar, urllib.request
+import os, json, math, random, tempfile, re, calendar, urllib.request, threading, uuid, statistics
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from flask import Flask, request, session, redirect, render_template_string
+from flask import Flask, request, session, redirect, render_template_string, jsonify
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -73,12 +73,24 @@ def flow():
     return Flow.from_client_config(cfg, SCOPES, redirect_uri=BASE + "/oauth/callback")
 
 # ---------- historique YouTube (l'apprentissage se lit directement sur ta chaîne) ----------
+def duree_s(d):
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", d or "")
+    return int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + int(m.group(3) or 0) if m else 0
+
 def historique(yt):
     up = yt.channels().list(part="contentDetails", mine=True).execute()["items"][0][
         "contentDetails"]["relatedPlaylists"]["uploads"]
-    ids = [i["contentDetails"]["videoId"] for i in yt.playlistItems().list(
-        part="contentDetails", playlistId=up, maxResults=50).execute().get("items", [])]
-    items = yt.videos().list(part="snippet,statistics,status", id=",".join(ids)).execute().get("items", []) if ids else []
+    ids, tok = [], None
+    for _ in range(2):  # jusqu'à 100 vidéos
+        r = yt.playlistItems().list(part="contentDetails", playlistId=up, maxResults=50,
+                                    **({"pageToken": tok} if tok else {})).execute()
+        ids += [i["contentDetails"]["videoId"] for i in r.get("items", [])]
+        tok = r.get("nextPageToken")
+        if not tok: break
+    items = []
+    for k in range(0, len(ids), 50):
+        items += yt.videos().list(part="snippet,statistics,status,contentDetails",
+                                  id=",".join(ids[k:k + 50])).execute().get("items", [])
     out = []
     for v in items:
         s, st, stt = v["snippet"], v.get("statistics", {}), v["status"]
@@ -86,6 +98,7 @@ def historique(yt):
         out.append(dict(id=v["id"], titre=s["title"], desc=s.get("description", ""),
                         pub=datetime.fromisoformat(pub.replace("Z", "+00:00")),
                         vues=int(st.get("viewCount", 0)), likes=int(st.get("likeCount", 0)),
+                        duree=duree_s(v.get("contentDetails", {}).get("duration")),
                         statut=stt["privacyStatus"],
                         img=s.get("thumbnails", {}).get("medium", {}).get("url", "")))
     return sorted(out, key=lambda v: v["pub"], reverse=True)
@@ -166,41 +179,109 @@ def choisir(hist, cfg, occ=None):
         reste = [h for h in cand if h not in base]
         random.shuffle(reste)
         pris_tags = (base + reste)[:n]
-    cand_h = list(dict.fromkeys([int(h) for h in cfg["heures"]] + DEFAUT_HEURES))
+    cand_h = list(dict.fromkeys(int(h) for h in cfg["heures"]))  # tes heures de pointe d'abord
+    for h in DEFAUT_HEURES:  # on complète seulement s'il n'y en a pas assez pour remplir une journée
+        if len(cand_h) >= int(cfg["max_jour"]): break
+        if h not in cand_h: cand_h.append(h)
     if appr: ranked = tirages(cand_h, stats_par(vids, lambda v: [heure_de(v)]), m0, s0)
     else: ranked = random.sample(cand_h, len(cand_h))
     quand = prochain_creneau(occupation(hist) if occ is None else occ, ranked, int(cfg["max_jour"]))
     return titre, oblig + pris_tags, quand.astimezone(timezone.utc), appr
 
 def gemini(prompt):
+    """Retourne (texte, erreur). Essaie plusieurs modèles si le premier ne répond pas."""
     key = os.environ.get("GEMINI_API_KEY")
-    if not key: return None
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        data=json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode(),
-        headers={"Content-Type": "application/json", "x-goog-api-key": key})
+    if not key: return None, "clé GEMINI_API_KEY absente sur Render"
+    noms = [os.environ.get("GEMINI_MODEL"), "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+    err = ""
+    for m in dict.fromkeys(x for x in noms if x):
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+            data=json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode(),
+            headers={"Content-Type": "application/json", "x-goog-api-key": key})
+        try:
+            r = json.load(urllib.request.urlopen(req, timeout=60))
+            return r["candidates"][0]["content"]["parts"][0]["text"].strip(), ""
+        except Exception as e:
+            err = f"{m} : {e}"
+    return None, err
+
+def variante_locale(bons, out, deja):
+    """Secours sans IA : mélange le début d'un de tes bons titres avec la fin d'un autre."""
+    emo = ["😴", "🎧", "✨", "💤", "🔊", "🌙"]
+    sep = r"[:?!|]|\s[-–]\s"
+    pris = {o.lower() for o in out}
+    for _ in range(30):
+        a, b = random.choice(bons), random.choice(bons)
+        tete = re.split(sep, a)[0].strip()
+        fin = (re.split(sep, b)[1:] or [""])[0].strip()
+        t = (f"{tete} : {fin}" if fin and fin != tete else f"{tete} {random.choice(emo)}")[:90]
+        if t.lower() not in deja and t.lower() not in pris: return t
+    return f"{bons[0][:80]} {random.choice(emo)}"
+
+def generer_titres(hist, cfg, n):
+    """n titres DIFFÉRENTS, inspirés de tes meilleures vidéos. Retourne (titres, erreur_ia)."""
+    pub = [v for v in hist if v["statut"] == "public"]
+    mes = mesurees(hist)
+    ref = sorted(mes if len(mes) >= 3 else pub, key=score, reverse=True)
+    bons = [x["titre"] for x in ref[:8]]
+    mauv = [x["titre"] for x in ref[-3:]] if len(ref) >= 8 else []
+    deja = {x["titre"].lower() for x in hist}
+    out = []
+    p = ("Tu aides une chaîne YouTube Shorts ASMR francophone.\n"
+         + ("Titres qui ont le MIEUX marché :\n- " + "\n- ".join(bons) + "\n" if bons else "")
+         + ("Titres qui ont le MOINS marché :\n- " + "\n- ".join(mauv) + "\n" if mauv else "")
+         + f"\nÉcris {n} titres DIFFÉRENTS les uns des autres, dans l'esprit des meilleurs (mots-clés, ton, longueur, structure) "
+           "sans en copier aucun. Max 70 caractères chacun. Un titre par ligne, sans numéro, sans guillemets, rien d'autre.")
+    txt, err = gemini(p)
+    for l in (txt or "").splitlines():
+        l = re.sub(r"^[\s\-\d.)*•]+", "", l).strip().strip('"')
+        if l and l.lower() not in deja and l.lower() not in {o.lower() for o in out}: out.append(l[:100])
+    for t in cfg["titres"]:
+        if len(out) >= n: break
+        if t.lower() not in deja and t.lower() not in {o.lower() for o in out}: out.append(t)
+    while len(out) < n:
+        out.append(variante_locale(bons or ["ASMR relaxant pour dormir"], out, deja))
+    return out[:n], err
+
+JOBS = []
+
+def traiter(cid, jobs):
+    """Tourne en arrière-plan : envoie chaque vidéo, vérifie qu'YouTube l'a bien reçue."""
     try:
-        r = json.load(urllib.request.urlopen(req, timeout=30))
-        return r["candidates"][0]["content"]["parts"][0]["text"].strip().strip('"')[:100]
-    except Exception:
-        return None
-
-def titre_ia(desc):
-    return gemini(f"Écris UN seul titre YouTube accrocheur (max 70 caractères) pour : {desc}\nRéponds uniquement par le titre.") \
-        or desc[:90]
-
-def titre_inspire(hist):
-    """Analyse tes titres : prend ceux qui marchent le mieux et en écrit un nouveau, proche mais pas identique."""
-    v = sorted(mesurees(hist), key=score, reverse=True)
-    if len(v) < 3: return None
-    p = ("Tu aides une chaîne YouTube ASMR francophone.\nTitres qui ont le MIEUX marché :\n- "
-         + "\n- ".join(x["titre"] for x in v[:8]) + "\n\nTitres qui ont le MOINS marché :\n- "
-         + "\n- ".join(x["titre"] for x in v[-3:])
-         + "\n\nÉcris UN nouveau titre dans l'esprit des meilleurs (mêmes mots-clés, même ton, même longueur, même structure) "
-           "mais différent : ne copie aucun titre. Max 70 caractères. Réponds uniquement par le titre.")
-    t = gemini(p)
-    return t if t and t.lower() not in {x["titre"].lower() for x in hist} else None
+        yt, cfg = yt_for(cid), config(cid)
+        hist = historique(yt); occ = occupation(hist)
+        titres, err_ia = generer_titres(hist, cfg, len(jobs))
+        for j, titre in zip(jobs, titres):
+            j.update(etat="envoi", titre=j.get("force") or titre, ia=err_ia)
+            try:
+                _, tags, when, appr = choisir(hist, cfg, occ)
+                body = {"snippet": {"title": j["titre"][:100], "description": " ".join(tags), "categoryId": "22"},
+                        "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False,
+                                   "publishAt": when.strftime("%Y-%m-%dT%H:%M:%S.000Z")}}
+                req = yt.videos().insert(part="snippet,status", body=body,
+                                         media_body=MediaFileUpload(j["path"], chunksize=8 * 1024 * 1024, resumable=True))
+                resp = None
+                while resp is None:
+                    st, resp = req.next_chunk()
+                    if st: j["pct"] = int(st.progress() * 100)
+                v = yt.videos().list(part="status", id=resp["id"]).execute().get("items", [])
+                if not v: raise Exception("YouTube ne retrouve pas la vidéo après l'envoi.")
+                stt = v[0]["status"]
+                warn = "" if stt.get("publishAt") else \
+                    "YouTube n'a pas gardé la programmation (projet Google non validé) : la vidéo reste privée."
+                j.update(etat="ok", pct=100, vid=resp["id"], warn=warn,
+                         quand=f"{when.astimezone(TZ):%d/%m à %Hh%M}")
+                hist.insert(0, dict(id=resp["id"], titre=j["titre"], desc=" ".join(tags), pub=when, vues=0, likes=0,
+                                    duree=0, statut="private", img=""))
+            except Exception as e:
+                j.update(etat="erreur", msg=str(e)[:300])
+    except Exception as e:
+        for j in jobs:
+            if j["etat"] == "attente": j.update(etat="erreur", msg=str(e)[:300])
+    finally:
+        for j in jobs:
+            if os.path.exists(j["path"]): os.unlink(j["path"])
 
 SOURCES = {"SHORTS": "Shorts", "YT_SEARCH": "Recherche YouTube", "SUGGESTED_VIDEO": "Vidéos suggérées",
            "BROWSE": "Accueil YouTube", "EXT_URL": "Sites externes", "NO_LINK_OTHER": "Direct / autre",
@@ -224,6 +305,95 @@ def analytique(cid, yt, j):
                 tot=dict(vues=sum(S(1)), heures=round(sum(S(2)) / 60, 1), likes=sum(S(3)), abos=sum(S(4)) - sum(S(5))),
                 top=[(noms.get(r[0], r[0]), r[1], round(r[2] / 60, 1)) for r in top],
                 src=[(SOURCES.get(r[0], r[0]), r[1]) for r in src])
+
+def barres(mon):
+    cibles = [("Vues Shorts sur 90 jours", mon["shorts"], 10_000_000), ("Abonnés", mon["subs"], 1000),
+              ("Heures vues sur 12 mois (autre voie)", mon["heures"], 4000)]
+    return [(n, v, c, min(100.0, round(v / c * 100, 1))) for n, v, c in cibles]
+
+def monetisation(cid, yt):
+    ya = build("youtubeAnalytics", "v2", credentials=creds_for(cid))
+    fin = datetime.now(TZ).date()
+    q = lambda j, **k: ya.reports().query(ids="channel==MINE", startDate=str(fin - timedelta(days=j)),
+                                          endDate=str(fin), **k).execute().get("rows", [])
+    shorts = sum(r[1] for r in q(90, metrics="views", dimensions="creatorContentType") if r[0] == "SHORTS")
+    heures = sum(r[0] for r in q(365, metrics="estimatedMinutesWatched")) / 60
+    subs = int(yt.channels().list(part="statistics", mine=True).execute()["items"][0]["statistics"].get("subscriberCount", 0))
+    return dict(shorts=shorts, heures=round(heures), subs=subs)
+
+def retention(cid):
+    try:
+        ya = build("youtubeAnalytics", "v2", credentials=creds_for(cid))
+        fin = datetime.now(TZ).date()
+        rows = ya.reports().query(ids="channel==MINE", startDate=str(fin - timedelta(days=90)), endDate=str(fin),
+                                  metrics="views,averageViewPercentage", dimensions="video", sort="-views",
+                                  maxResults=200).execute().get("rows", [])
+        return {r[0]: dict(ret=r[2]) for r in rows}
+    except Exception:
+        return {}
+
+def analyser(hist, ret, seuil):
+    """Compare tes vidéos sous le seuil (vues/jour) à tes meilleures et cherche pourquoi elles n'ont pas percé."""
+    now = datetime.now(timezone.utc); rows = []
+    for v in hist:
+        age = (now - v["pub"]).total_seconds() / 86400
+        if v["statut"] != "public" or age < 2: continue
+        rows.append(dict(v, vpj=v["vues"] / age, age=age, nb_tags=len(hashtags_de(v)), long_t=len(v["titre"]),
+                         q="?" in v["titre"], asmr="asmr" in v["titre"].lower(),
+                         jlike=v["likes"] / max(v["vues"], 1) * 100, ret=ret.get(v["id"], {}).get("ret"),
+                         h=heure_de(v)))
+    if len(rows) < 4: return None
+    bas = sorted([r for r in rows if r["vpj"] < seuil], key=lambda r: r["vpj"])
+    bons = [r for r in rows if r["vpj"] >= seuil]
+    if len(bons) < 3: bons = sorted(rows, key=lambda r: -r["vpj"])[:max(3, len(rows) // 4)]
+    ref_bas = bas or [r for r in rows if r not in bons]
+    med = lambda g, k: statistics.median([r[k] for r in g if r[k] is not None] or [0]) if any(r[k] is not None for r in g) else None
+    part = lambda g, k: sum(1 for r in g if r[k]) / max(len(g), 1)
+    cles = [("Longueur du titre (caractères)", "long_t"), ("Durée (secondes)", "duree"), ("Hashtags", "nb_tags"),
+            ("J'aime pour 100 vues", "jlike"), ("Rétention moyenne (%)", "ret")]
+    fm = lambda x: "?" if x is None else f"{x:.1f}" if x < 100 else f"{x:.0f}"
+    comp = [(l, fm(med(bons, k)), fm(med(ref_bas, k))) for l, k in cles]
+    comp += [("Titre avec « ASMR »", f"{part(bons, 'asmr') * 100:.0f} %", f"{part(ref_bas, 'asmr') * 100:.0f} %"),
+             ("Titre avec une question", f"{part(bons, 'q') * 100:.0f} %", f"{part(ref_bas, 'q') * 100:.0f} %")]
+    mes = {k: med(bons, k) for _, k in cles}
+    th = {}
+    for r in rows:
+        for h in set(hashtags_de(r)): th.setdefault(h, []).append(r["vpj"])
+    lift = sorted(((h, len(l), round(sum(l) / len(l))) for h, l in th.items() if 2 <= len(l) < len(rows)), key=lambda x: -x[2])
+    tags_bons, tags_mauv = lift[:5], (lift[-5:][::-1] if len(lift) > 5 else [])
+    hh = {}
+    for r in rows: hh.setdefault(r["h"], []).append(r["vpj"])
+    hs = sorted(((h, len(l), round(sum(l) / len(l))) for h, l in hh.items() if len(l) >= 2), key=lambda x: -x[2])
+    pires = {h for h, _, _ in hs[-2:]} if len(hs) >= 4 else set()
+    mauv = {h for h, _, _ in tags_mauv}
+    for r in bas:
+        w = []
+        if mes["duree"] and r["duree"] > mes["duree"] * 1.3:
+            w.append(f"Trop longue : {r['duree']} s contre {mes['duree']:.0f} s chez tes meilleures.")
+        if r["ret"] is not None and mes["ret"] and r["ret"] < mes["ret"] * 0.85:
+            w.append(f"Rétention faible : {r['ret']:.0f} % regardés (tes meilleures : {mes['ret']:.0f} %). Les premières secondes n'accrochent pas assez.")
+        if mes["long_t"] and abs(r["long_t"] - mes["long_t"]) > mes["long_t"] * 0.4:
+            w.append(f"Titre {'trop long' if r['long_t'] > mes['long_t'] else 'trop court'} ({r['long_t']} caractères, tes meilleurs : ~{mes['long_t']:.0f}).")
+        if not r["asmr"] and part(bons, "asmr") > 0.6: w.append("Pas de « ASMR » dans le titre, alors que la plupart de tes meilleures vidéos l'ont.")
+        if not r["q"] and part(bons, "q") > 0.4: w.append("Pas de question dans le titre, alors que tes meilleures en ont souvent une.")
+        if mes["jlike"] and r["jlike"] < mes["jlike"] * 0.6: w.append(f"Peu de j'aime ({r['jlike']:.1f} pour 100 vues contre {mes['jlike']:.1f}) : le contenu donne peu envie de réagir.")
+        m2 = [h for h in hashtags_de(r) if h in mauv]
+        if m2: w.append("Hashtags qui tirent vers le bas chez toi : " + " ".join(m2) + ".")
+        if r["h"] in pires: w.append(f"Publiée vers {r['h']}h, une de tes pires heures.")
+        if r["age"] < 7: w.append("Encore récente : l'algorithme peut encore la pousser.")
+        r["why"] = w[:5] or ["Aucun écart net avec tes meilleures vidéos : le sujet, le son ou la miniature jouent sûrement."]
+    cs = []
+    a, b = mes["duree"], med(ref_bas, "duree")
+    if a and b and b > a * 1.25: cs.append(f"Durée : tes meilleures vidéos font ~{a:.0f} s, les autres ~{b:.0f} s. Raccourcis.")
+    a, b = mes["ret"], med(ref_bas, "ret")
+    if a and b and b < a * 0.85: cs.append(f"Rétention : {a:.0f} % pour tes meilleures contre {b:.0f} %. Va droit au son principal dès la première seconde.")
+    a, b = mes["long_t"], med(ref_bas, "long_t")
+    if a and b and abs(a - b) > a * 0.25: cs.append(f"Titres : les meilleurs font ~{a:.0f} caractères, les autres ~{b:.0f}.")
+    if tags_mauv: cs.append("À retirer : " + " ".join(h for h, _, _ in tags_mauv) + ".")
+    if tags_bons: cs.append("À garder : " + " ".join(h for h, _, _ in tags_bons) + ".")
+    if hs: cs.append("Tes meilleures heures : " + ", ".join(f"{h}h" for h, _, _ in hs[:3]) + ".")
+    return dict(n=len(rows), nb_bons=len(rows) - len(bas), bas=bas[:30], comp=comp, conseils=cs, tags_bons=tags_bons,
+                tags_mauv=tags_mauv, heures=hs, top=sorted(rows, key=lambda r: -r["vpj"])[:8])
 
 # ---------- accès ----------
 def authed(f):
@@ -283,34 +453,47 @@ def callback():
 def upload():
     cid = active()
     if not cid: return redirect("/connect")
-    yt, cfg = yt_for(cid), config(cid)
-    hist = historique(yt)
-    occ = occupation(hist)
-    fichiers = [f for f in request.files.getlist("video") if f.filename]
-    saisi = request.form.get("title", "").strip() if len(fichiers) == 1 else ""
-    faits, modes = [], set()
-    for f in fichiers:
-        titre, tags, when, appr = choisir(hist, cfg, occ)
-        inspire = None if saisi else titre_inspire(hist)
-        modes.add("écrit par toi" if saisi else "inspiré de tes meilleurs titres" if inspire
-                  else "tiré de ta liste" if titre else "IA")
-        titre = saisi or inspire or titre or titre_ia("ASMR relaxant")
-        texte = " ".join(tags)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        f.save(tmp.name)
-        body = {"snippet": {"title": titre[:100], "description": texte, "categoryId": "22"},
-                "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False,
-                           "publishAt": when.strftime("%Y-%m-%dT%H:%M:%S.000Z")}}
-        req = yt.videos().insert(part="snippet,status", body=body,
-                                 media_body=MediaFileUpload(tmp.name, chunksize=8 * 1024 * 1024, resumable=True))
-        resp = None
-        while resp is None:
-            _, resp = req.next_chunk()
-        os.unlink(tmp.name)
-        hist.insert(0, dict(id="", titre=titre, desc=texte, pub=when, vues=0, likes=0, statut="private", img=""))
-        faits.append(f"{when.astimezone(TZ):%d/%m à %Hh%M}")
-    mode = " / ".join(sorted(modes)) + " · hashtags " + ("optimisés" if appr else "en test")
-    return redirect(f"/?msg={len(faits)} vidéo(s) programmée(s) : " + " · ".join(faits) + f" ({mode})")
+    jobs = []
+    for f in request.files.getlist("video"):
+        if not f.filename: continue
+        p = os.path.join(tempfile.gettempdir(), uuid.uuid4().hex + ".mp4")
+        f.save(p)
+        if os.path.getsize(p) == 0:
+            os.unlink(p); continue
+        jobs.append(dict(nom=f.filename, path=p, etat="attente", pct=0, titre="", msg="", warn="", vid="", quand="", ia=""))
+    if not jobs: return redirect("/?msg=Aucune vidéo reçue : réessaie de choisir tes fichiers.")
+    if len(jobs) == 1 and request.form.get("title", "").strip(): jobs[0]["force"] = request.form["title"].strip()
+    JOBS[:] = JOBS[-30:] + jobs
+    threading.Thread(target=traiter, args=(cid, jobs), daemon=True).start()
+    return redirect("/file")
+
+@app.route("/file")
+@authed
+def file():
+    return vue("file")
+
+@app.route("/file.json")
+@authed
+def file_json():
+    return jsonify([{k: v for k, v in j.items() if k != "path"} for j in JOBS[-12:]])
+
+@app.route("/diagnostic")
+@authed
+def diagnostic():
+    cid = active()
+    if not cid: return redirect("/")
+    seuil = int(request.args.get("seuil", 1500))
+    d = analyser(historique(yt_for(cid)), retention(cid), seuil)
+    ia = err = None
+    if d and request.args.get("ia"):
+        L = lambda r: (f"- «{r['titre']}» | {r['vpj']:.0f} vues/j | {r['duree']} s | rétention {r['ret'] if r['ret'] is not None else '?'} % | "
+                       f"{r['jlike']:.1f} j'aime/100 vues | {r['nb_tags']} hashtags | publiée à {r['h']}h")
+        p = ("Tu es expert YouTube Shorts ASMR. Voici les vidéos d'une chaîne francophone.\nLES MEILLEURES :\n"
+             + "\n".join(L(r) for r in d["top"]) + "\nLES MOINS BONNES :\n" + "\n".join(L(r) for r in d["bas"][:15])
+             + "\n\nAnalyse en profondeur pourquoi les moins bonnes n'ont pas percé et donne 8 actions concrètes et précises "
+               "(titre, hashtags, durée, accroche des premières secondes, son, miniature, heure, format). Réponds en français, texte simple, sans markdown.")
+        ia, err = gemini(p)
+    return vue("diag", d=d, seuil=seuil, ia=ia, err=err)
 
 @app.route("/calendrier")
 @authed
@@ -348,10 +531,12 @@ def stats():
     yt = yt_for(cid); v = mesurees(historique(yt))
     top = lambda cles: sorted(((k, n, round(m, 2)) for k, (n, m) in stats_par(v, cles).items()),
                               key=lambda x: -x[2])[:6]
-    an, err = None, None
+    an, err, mon = None, None, None
     try: an = analytique(cid, yt, j)
     except Exception as e: err = str(e)[:260]
-    return vue("stats", j=j, an=an, err=err, nm=len(v), mini=MIN_APPRENTISSAGE,
+    try: mon = barres(monetisation(cid, yt))
+    except Exception: pass
+    return vue("stats", j=j, an=an, err=err, mon=mon, nm=len(v), mini=MIN_APPRENTISSAGE,
                heures=top(lambda x: [f"{heure_de(x)}h"]), titres=top(lambda x: [x["titre"]]),
                tags=top(hashtags_de))
 
@@ -422,6 +607,9 @@ table{width:100%;border-collapse:separate;border-spacing:0;border-radius:16px;ov
 .box{border-radius:20px;padding:10px 14px}.row{position:relative;display:flex;justify-content:space-between;padding:8px 0;font-size:.9rem}
 .row i{position:absolute;left:0;bottom:2px;height:3px;border-radius:3px;background:var(--acc);opacity:.7}.row em{font-style:normal;color:var(--mut)}
 .ch a.on{background:var(--tint);color:var(--acc)}
+.pb{margin:10px 0}.pt{display:flex;justify-content:space-between;font-size:.9rem;margin-bottom:5px}.pt b{font-weight:600}
+.tr{height:10px;border-radius:99px;background:var(--line);overflow:hidden}.tr i{display:block;height:100%;border-radius:99px;background:var(--acc);transition:width .4s}
+.job{padding:12px 16px;border-radius:18px;margin:10px 0}.job ul{margin:.4em 0 0;padding-left:1.1em;font-size:.88rem}.job li{margin:.25em 0}
 @media(max-width:560px){.d{min-height:74px}.e{font-size:.6rem}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body><main>
@@ -429,7 +617,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;border-radius:16px;ov
 <h1>Accès privé</h1><form method="post"><label>Mot de passe</label>
 <input type="password" name="pw" autofocus><button>Entrer</button>{% if err %}<p class="err">{{err}}</p>{% endif %}</form>
 {% else %}
-<nav>{% for k,l,u in [('publier','Publier','/'),('cal','Calendrier','/calendrier'),('biblio','Bibliothèque','/bibliotheque'),('stats','Stats','/stats'),('reglages','Réglages','/reglages')] %}
+<nav>{% for k,l,u in [('publier','Publier','/'),('file','File','/file'),('cal','Calendrier','/calendrier'),('biblio','Bibliothèque','/bibliotheque'),('stats','Stats','/stats'),('diag','Diagnostic','/diagnostic'),('reglages','Réglages','/reglages')] %}
 <a class="{{'on' if view==k}}" href="{{u}}">{{l}}</a>{% endfor %}</nav>
 <nav>{% for i,n in chaines %}<a class="{{'on' if i==cid}}" href="/canal/{{i}}?retour={{request.path}}">{{n}}</a>{% endfor %}<a href="/connect">+ Chaîne</a></nav>
 {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
@@ -438,11 +626,11 @@ table{width:100%;border-collapse:separate;border-spacing:0;border-radius:16px;ov
 <h1>Dépose tes vidéos.</h1><p>Tu peux en choisir plusieurs. Maximum {{c.max_jour}} par jour, publiées 5 min avant les heures de pointe. Le jour suivant se remplit tout seul.</p>
 <form id="fm" method="post" action="/upload" enctype="multipart/form-data">
 <label>Vidéos ou Shorts</label><input type="file" name="video" accept="video/*" multiple required>
-<label>Titre (vide = choisi pour toi ; ignoré si tu envoies plusieurs vidéos)</label><input name="title">
+<label>Titre (facultatif, seulement si tu envoies une seule vidéo)</label><input name="title">
 <div class="bar" id="bar"><i></i></div><p id="wt"></p><button id="bt">Programmer</button></form>
 <script>
 fm.addEventListener('submit',function(e){e.preventDefault();var x=new XMLHttpRequest();x.open('POST','/upload');
-x.upload.onprogress=function(v){if(v.lengthComputable){var p=Math.round(v.loaded/v.total*100);bar.firstChild.style.width=p+'%';wt.textContent=p<100?'Envoi '+p+' %':'Envoi vers YouTube…'}};
+x.upload.onprogress=function(v){if(v.lengthComputable){var p=Math.round(v.loaded/v.total*100);bar.firstChild.style.width=p+'%';wt.textContent=p<100?'Envoi '+p+' %':'Réception terminée…'}};
 x.onload=function(){if(x.status>=400){wt.textContent='Erreur côté site, réessaie.';bt.disabled=false}else{location.href=x.responseURL||'/'}};
 x.onerror=function(){wt.textContent='Erreur réseau, réessaie.';bt.disabled=false};
 bar.style.display='block';bt.disabled=true;x.send(new FormData(fm))});
@@ -496,6 +684,37 @@ svg.addEventListener('pointermove',mv);svg.addEventListener('pointerdown',mv)}
 <h2>Ce que le site a appris</h2><p>{{nm}} vidéos mesurées sur {{mini}} nécessaires. {{'Actif : titres, hashtags et heures s’adaptent à ce qui marche.' if nm>=mini else 'Phase de test : il essaie des variantes pour voir ce qui marche.'}}</p>
 {% for nom,l in [('Meilleures heures',heures),('Meilleurs titres',titres),('Meilleurs hashtags',tags)] %}<h2>{{nom}}</h2>
 <table><tr><th>Valeur</th><th>Vidéos</th><th>Score</th></tr>{% for k,n2,m in l %}<tr><td>{{k}}</td><td>{{n2}}</td><td>{{m}}</td></tr>{% endfor %}</table>{% endfor %}
+{% if mon %}<h2>Progression vers la monétisation</h2><div class="g box">
+{% for n,v,c,p in mon %}<div class="pb"><div class="pt"><span>{{n}}</span><b>{{v}} / {{c}} · {{p}} %</b></div><div class="tr"><i style="width:{{p}}%"></i></div></div>{% endfor %}
+<p style="font-size:.8rem">Voie Shorts : 1 000 abonnés + 10 M de vues Shorts sur 90 jours. À partir du 1er février 2027, les nouveaux inscrits devront 20 M.</p></div>{% endif %}
+{% elif view=='file' %}
+<h1>File d’attente</h1><p>Garde cette page ouverte : l’envoi vers YouTube continue pendant qu’elle est ouverte.</p><div id="q"></div>
+<script>
+function esc(t){var d=document.createElement('div');d.textContent=t==null?'':t;return d.innerHTML}
+function load(){fetch('/file.json').then(function(r){return r.json()}).then(function(L){
+document.getElementById('q').innerHTML=L.map(function(j){var s={attente:'En attente',envoi:'Envoi '+j.pct+' %',ok:'Programmée',erreur:'Erreur'}[j.etat];
+return '<div class="g job"><b>'+esc(j.titre||j.nom)+'</b><div class="mut">'+s+(j.quand?' · '+esc(j.quand):'')+(j.vid?' · <a href="https://studio.youtube.com/video/'+j.vid+'/edit" target="_blank">Ouvrir dans Studio</a>':'')+'</div>'
++(j.etat=='envoi'?'<div class="tr"><i style="width:'+j.pct+'%"></i></div>':'')+(j.warn?'<p class="err">'+esc(j.warn)+'</p>':'')+(j.msg?'<p class="err">'+esc(j.msg)+'</p>':'')+(j.ia?'<p class="mut">IA indisponible : '+esc(j.ia)+'</p>':'')+'</div>'}).join('')||'<p>Rien en cours.</p>'})}
+load();setInterval(load,3000);
+</script>
+{% elif view=='diag' %}
+<div class="ch"><h1>Diagnostic</h1><div>{% for s in [500,1500,5000] %}<a class="{{'on' if seuil==s}}" href="/diagnostic?seuil={{s}}">&lt; {{s}}/j</a>{% endfor %}</div></div>
+<p>Vidéos publiées depuis plus de 2 jours, comparées à tes meilleures. Seuil : {{seuil}} vues par jour.</p>
+{% if not d %}<div class="msg">Pas assez de vidéos publiées pour analyser (il en faut au moins 4).</div>{% else %}
+<div class="kpi"><div class="g"><span>Sous le seuil</span><b>{{d.bas|length}}</b></div><div class="g"><span>Au-dessus</span><b>{{d.nb_bons}}</b></div><div class="g"><span>Analysées</span><b>{{d.n}}</b></div></div>
+{% for c in d.conseils %}<div class="msg">{{c}}</div>{% endfor %}
+<h2>Meilleures vidéos contre les autres</h2>
+<table><tr><th></th><th>Meilleures</th><th>Sous le seuil</th></tr>{% for l,b,m in d.comp %}<tr><td>{{l}}</td><td>{{b}}</td><td>{{m}}</td></tr>{% endfor %}</table>
+{% if d.tags_bons %}<h2>Hashtags : vues par jour</h2><table><tr><th>Hashtag</th><th>Vidéos</th><th>Vues/jour</th></tr>
+{% for h,n,v in d.tags_bons %}<tr><td>{{h}}</td><td>{{n}}</td><td>{{v}}</td></tr>{% endfor %}{% for h,n,v in d.tags_mauv %}<tr><td>{{h}} (faible)</td><td>{{n}}</td><td>{{v}}</td></tr>{% endfor %}</table>{% endif %}
+{% if d.heures %}<h2>Heures : vues par jour</h2><table>{% for h,n,v in d.heures[:6] %}<tr><td>{{h}}h</td><td>{{n}} vidéos</td><td>{{v}}</td></tr>{% endfor %}</table>{% endif %}
+<h2>Vidéo par vidéo</h2>
+{% for r in d.bas %}<div class="g job"><b>{{r.titre}}</b><div class="mut">{{r.vpj|round|int}} vues/jour · {{r.vues}} vues · {{r.duree}} s{% if r.ret is not none %} · rétention {{r.ret|round|int}} %{% endif %}</div>
+<ul>{% for x in r.why %}<li>{{x}}</li>{% endfor %}</ul></div>{% endfor %}
+<h2>Analyse approfondie par l’IA</h2>
+{% if ia %}<div class="g box" style="white-space:pre-wrap">{{ia}}</div>
+{% else %}{% if err %}<div class="msg">IA indisponible : {{err}}</div>{% endif %}<a class="btn" href="/diagnostic?seuil={{seuil}}&ia=1">Lancer l’analyse IA</a>{% endif %}
+{% endif %}
 {% elif view=='reglages' %}
 <h1>Réglages</h1><form method="post">
 <label>Tes titres (un par ligne)</label><textarea name="titres">{{c.titres|join('\n')}}</textarea>
