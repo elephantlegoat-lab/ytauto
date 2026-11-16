@@ -34,16 +34,65 @@ AVANCE_MIN = 5  # on publie 5 min avant l'heure de pointe
 MIN_APPRENTISSAGE = 8  # en dessous : on explore au hasard
 
 # ---------- chaînes (une par fichier) ----------
-def _p(cid): return f"{DATA}/chaines/{cid}.json"
-def charger(cid):
-    return json.load(open(_p(cid))) if cid and os.path.exists(_p(cid)) else None
-def sauver(cid, d): json.dump(d, open(_p(cid), "w"))
+REDIS = bool(os.environ.get("UPSTASH_REDIS_REST_URL") and os.environ.get("UPSTASH_REDIS_REST_TOKEN"))
+_MEM = {}
+
+def _redis(*cmd):
+    """Une commande Redis via l'API web d'Upstash (gratuit, données conservées)."""
+    rq = urllib.request.Request(os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/"), data=json.dumps(list(cmd)).encode(),
+                                headers={"Authorization": "Bearer " + os.environ["UPSTASH_REDIS_REST_TOKEN"],
+                                         "Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(rq, timeout=15)).get("result")
+
+def _fichier(cle):
+    return f"{DATA}/chaines/{cle[7:]}.json" if cle.startswith("chaine:") else f"{DATA}/{cle}.json"
+
+def kv_get(cle):
+    t, v = _MEM.get(cle, (0, None))
+    if v is not None and time.time() - t < 30: return json.loads(v)
+    if REDIS:
+        try:
+            raw = _redis("GET", cle)
+            if raw:
+                _MEM[cle] = (time.time(), raw); return json.loads(raw)
+        except Exception: pass  # Upstash injoignable : on se rabat sur le fichier local
+    try: return json.load(open(_fichier(cle)))
+    except Exception: return None
+
+def kv_set(cle, val):
+    raw = json.dumps(val)
+    _MEM[cle] = (time.time(), raw); _MEM.pop("__liste", None)
+    try: open(_fichier(cle), "w").write(raw)
+    except Exception: pass
+    if REDIS:
+        try:
+            _redis("SET", cle, raw)
+            if cle.startswith("chaine:"): _redis("SADD", "chaines", cle[7:])
+        except Exception: pass
+
+def charger(cid): return kv_get("chaine:" + cid) if cid else None
+def sauver(cid, d): kv_set("chaine:" + cid, d)
+
 def liste():
+    t, v = _MEM.get("__liste", (0, None))
+    if v is not None and time.time() - t < 30: return v
+    ids = {f[:-5] for f in os.listdir(DATA + "/chaines") if f.endswith(".json")}
+    if REDIS:
+        try: ids |= set(_redis("SMEMBERS", "chaines") or [])
+        except Exception: pass
     out = []
-    for f in sorted(os.listdir(DATA + "/chaines")):
-        if f.endswith(".json"):
-            out.append((f[:-5], charger(f[:-5])["nom"]))
+    for i in sorted(ids):
+        d = kv_get("chaine:" + i)
+        if d: out.append((i, d["nom"]))
+    _MEM["__liste"] = (time.time(), out)
     return out
+
+def etat_stockage():
+    if not REDIS: return "temporaire : tout est effacé quand le site redémarre (branche Upstash pour tout garder)."
+    try:
+        _redis("PING"); return "permanent (Upstash) : connecté."
+    except Exception as e:
+        return "Upstash est configuré mais injoignable (" + str(e)[:90] + ") : données gardées seulement en temporaire."
 def active():
     ids = [c for c, _ in liste()]
     return session.get("cid") if session.get("cid") in ids else (ids[0] if ids else None)
@@ -558,8 +607,7 @@ def bilan_texte(cid, nom, yt, hist, cfg):
     return "\n".join(L)
 
 def lire_etat():
-    try: return json.load(open(DATA + "/notif.json"))
-    except Exception: return {}
+    return kv_get("notif") or {}
 
 def verifier():
     """Alerte stock bas (8h-22h, au plus toutes les 12 h) + bilan le vendredi soir (dès 18h, une fois)."""
@@ -578,8 +626,7 @@ def verifier():
                 if any(ok for _, ok, _ in notifier(f"Bilan de la semaine — {nom}", bilan_texte(cid, nom, yt, hist, cfg), cid)):
                     etat[cle] = str(now.date())
         except Exception: continue
-    try: json.dump(etat, open(DATA + "/notif.json", "w"))
-    except Exception: pass
+    kv_set("notif", etat)
 
 def boucle():
     time.sleep(60)
@@ -886,7 +933,7 @@ def reglages():
                        "apprentissage": bool(f.get("apprentissage"))}
         sauver(cid, d)
         return redirect("/reglages?msg=Réglages enregistrés.")
-    return vue("reglages", c=config(cid), notif=moyens())
+    return vue("reglages", c=config(cid), notif=moyens(), stockage=etat_stockage())
 
 PAGE = """{% macro semaine(sem, mx) %}<div class="g wk"><h3>LES 7 PROCHAINS JOURS <em>{{mx}} / jour</em></h3><div class="wd">{% for s in sem %}<div class="dy {{'td' if loop.first}}"><small>{{s.lab}}</small><b>{{s.jour.day}}</b><i class="dots">{% for x in range(mx) %}<u class="{{'f' if x<s.n}}"></u>{% endfor %}</i>{% for h in s.heures %}<span>{{h}}</span>{% endfor %}</div>{% endfor %}</div></div>{% endmacro %}
 <!doctype html><html lang="fr"><head><meta charset="utf-8">
@@ -1101,7 +1148,7 @@ load();setInterval(load,3000);
 {% else %}{% if err %}<div class="msg">IA indisponible : {{err}}</div>{% endif %}<a class="btn" href="/diagnostic?seuil={{seuil}}&ia=1">Lancer l’analyse IA</a>{% endif %}
 {% endif %}
 {% elif view=='reglages' %}
-<h1>Réglages</h1><form method="post">
+<h1>Réglages</h1><p>Stockage des données : {{stockage}}</p><form method="post">
 <label>Tes titres (un par ligne)</label><textarea name="titres">{{c.titres|join('\n')}}</textarea>
 <label>Hashtags obligatoires (toujours en description)</label><input name="oblig" value="{{c.oblig|join(', ')}}">
 <label>Hashtags candidats en plus (le site choisit les meilleurs parmi eux, 15 par vidéo)</label><textarea name="pool">{{c.pool|join(', ')}}</textarea>
