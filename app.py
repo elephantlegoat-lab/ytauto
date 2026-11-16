@@ -588,6 +588,77 @@ def boucle():
         except Exception: pass
         time.sleep(600)
 
+MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+
+def _duree_txt(j):
+    if j < 60: return f"{int(round(j))} jours"
+    if j < 730: return f"{j / 30.4:.0f} mois"
+    return f"{j / 365:.1f} ans".replace(".", ",")
+
+def _quand(j):
+    if j > 365 * 80: return "plus de 80 ans"
+    d = datetime.now(TZ).date() + timedelta(days=int(j))
+    return f"{d.day} {MOIS[d.month - 1]} {d.year} (dans {_duree_txt(j)})"
+
+def prevision(cid, yt, hist):
+    """Estimation des vues à venir + date des paliers d'abonnés. Estimation, pas une promesse."""
+    ya = build("youtubeAnalytics", "v2", credentials=creds_for(cid))
+    fin = datetime.now(TZ).date()
+    rows = ya.reports().query(ids="channel==MINE", startDate=str(fin - timedelta(days=40)), endDate=str(fin),
+                              metrics="views,subscribersGained,subscribersLost", dimensions="day", sort="day").execute().get("rows", [])
+    if len(rows) >= 4 and rows[-1][1] < 0.5 * sum(r[1] for r in rows[-4:-1]) / 3: rows = rows[:-1]  # dernier jour incomplet
+    if len(rows) < 8: raise ValueError("pas assez de jours confirmés par YouTube (il en faut 8)")
+    mean = lambda l: sum(l) / len(l)
+    v = [r[1] for r in rows]
+    r7 = mean(v[-7:]); p7 = mean(v[-14:-7]) if len(v) >= 14 else r7
+    g = min(1.03, max(0.97, (r7 / p7) ** (1 / 7))) if p7 > 0 and r7 > 0 else 1.0
+    m14 = mean(v[-14:]); cv = statistics.pstdev(v[-14:]) / m14 if m14 > 0 else 0.3
+    r = r7
+    try:  # on ajoute ce qu'on sait des derniers jours pas encore confirmés
+        rc = recent(cid, yt)
+        if rc and rc["jours"] >= 1 and rc["est"] > 0:
+            r = 0.5 * r7 + 0.5 * min(max(rc["est"] / rc["jours"], 0.5 * r7), 2 * r7)
+    except Exception: pass
+    now = datetime.now(timezone.utc)
+    vp = lambda x: x["vues"] / min((now - x["pub"]).total_seconds() / 86400, 7)
+    pub = [x for x in hist if x["statut"] == "public" and (now - x["pub"]).days >= 2]
+    sh = [x for x in pub if 0 < x["duree"] <= 180]
+    if len(sh) < 6: sh = pub
+    gm = mean([vp(x) for x in sh]) if sh else 0
+    tl, hl = {}, {}
+    if gm > 0 and len(sh) >= 6:
+        th, hh = {}, {}
+        for x in sh:
+            for h in set(hashtags_de(x)): th.setdefault(h, []).append(vp(x))
+            hh.setdefault(heure_de(x), []).append(vp(x))
+        shrink = lambda l, k: 1 + (mean(l) / gm - 1) * len(l) / (len(l) + k)
+        tl = {h: shrink(l, 5) for h, l in th.items() if 3 <= len(l) < len(sh)}
+        hl = {h: shrink(l, 3) for h, l in hh.items() if len(l) >= 2}
+    fac = lambda x: mean([tl.get(h, 1) for h in hashtags_de(x)] or [1]) * hl.get(heure_de(x), 1)
+    rec = [x for x in hist if x["statut"] == "public" and (now - x["pub"]).days < 7]
+    up = [x for x in hist if x["pub"] > now]
+    f_rec = mean([fac(x) for x in rec]) if rec else 1
+    f_rel = min(1.25, max(0.8, mean([fac(x) for x in up]) / f_rec)) if up and f_rec > 0 else 1.0
+    span = max(1, (max(x["pub"] for x in up) - now).days + 1) if up else 1
+    total = lambda H: sum(r * g ** d * (1 + (f_rel - 1) * min(1, span / d)) for d in range(1, H + 1))
+    preds = []
+    for lab, H in (("24 heures", 1), ("48 heures", 2), ("1 semaine", 7), ("1 mois", 30)):
+        c = total(H); rel = math.sqrt((cv / math.sqrt(H)) ** 2 + 0.15 ** 2 + (0.25 * H / 30) ** 2)
+        preds.append((lab, int(c), int(max(0, c * (1 - rel))), int(c * (1 + rel))))
+    lifts = sorted(tl.items(), key=lambda x: -x[1])
+    net7 = sum(r_[2] - r_[3] for r_ in rows[-7:]); par_jour = net7 / 7
+    subs = int(yt.channels().list(part="statistics", mine=True).execute()["items"][0]["statistics"].get("subscriberCount", 0))
+    obj = []
+    for cible in (20000, 50000, 100000):
+        if subs >= cible: obj.append((cible, "déjà atteint", "déjà atteint"))
+        elif par_jour <= 0: obj.append((cible, "pas atteignable à ce rythme", "pas atteignable à ce rythme"))
+        else:
+            j = (cible - subs) / par_jour
+            obj.append((cible, _quand(j), _quand(j / 2)))
+    return dict(preds=preds, nb=len(sh), r=int(r), tend=f"{(g - 1) * 100:+.1f} %", frel=round(f_rel, 2),
+                bons=[h for h, l in lifts if l > 1.05][:3], mauvais=[h for h, l in lifts[::-1] if l < 0.95][:3],
+                subs=subs, par_jour=round(par_jour, 1), objectifs=obj)
+
 # ---------- accès ----------
 def authed(f):
     def w(*a, **k):
@@ -703,9 +774,16 @@ def diagnostic():
     cid = active()
     if not cid: return redirect("/")
     seuil = int(request.args.get("seuil", 1500))
-    d = perr = None
-    try: d = analyser(historique(yt_for(cid)), retention(cid), seuil)
-    except Exception as e: perr = str(e)[:300]
+    d = perr = pred = perr2 = None
+    try:
+        yt = yt_for(cid); hist = historique(yt)
+    except Exception as e:
+        hist = None; perr = perr2 = str(e)[:300]
+    if hist is not None:
+        try: d = analyser(hist, retention(cid), seuil)
+        except Exception as e: perr = str(e)[:300]
+        try: pred = prevision(cid, yt, hist)
+        except Exception as e: perr2 = str(e)[:200]
     ia = err = None
     if d and request.args.get("ia"):
         L = lambda r: (f"- «{r['titre']}» | {r['vpj']:.0f} vues/j | {r['duree']} s | rétention {r['ret'] if r['ret'] is not None else '?'} % | "
@@ -715,7 +793,7 @@ def diagnostic():
              + "\n\nAnalyse en profondeur pourquoi les moins bonnes n'ont pas percé et donne 8 actions concrètes et précises "
                "(titre, hashtags, durée, accroche des premières secondes, son, miniature, heure, format). Réponds en français, texte simple, sans markdown.")
         ia, err = gemini(p)
-    return vue("diag", d=d, seuil=seuil, ia=ia, err=err, perr=perr)
+    return vue("diag", d=d, seuil=seuil, ia=ia, err=err, perr=perr, pred=pred, perr2=perr2)
 
 @app.route("/calendrier")
 @authed
@@ -995,6 +1073,14 @@ load();setInterval(load,3000);
 </script>
 {% elif view=='diag' %}
 <div class="ch"><h1>Diagnostic</h1><div>{% for s in [500,1500,5000] %}<a class="{{'on' if seuil==s}}" href="/diagnostic?seuil={{s}}">&lt; {{s}}/j</a>{% endfor %}</div></div>
+{% if pred %}<h2>Prévision de vues</h2>
+<div class="kpi">{% for lab,c,lo,hi in pred.preds %}<div class="g kp"><span>{{lab}}</span><b>{{c|k}}</b><em>entre {{lo|k}} et {{hi|k}}</em></div>{% endfor %}</div>
+<div class="g box"><p style="font-size:.88rem">Basé sur tes <b>{{pred.nb}} Shorts récents</b> : rythme actuel ≈ <b>{{pred.r|k}} vues par jour</b> ({{pred.tend}} par jour de tendance). Les hashtags et les heures des vidéos déjà programmées changent la prévision de <b>×{{pred.frel}}</b> par rapport à tes dernières publications.{% if pred.bons %} Hashtags qui rapportent chez toi : {{pred.bons|join(' ')}}.{% endif %}{% if pred.mauvais %} À éviter : {{pred.mauvais|join(' ')}}.{% endif %} C’est une estimation à partir de tes propres données, pas une garantie : un Short qui décolle change tout.</p></div>
+<h2>Projection d’abonnés</h2>
+<p>Tu as environ <b>{{pred.subs}}</b> abonnés et tu en gagnes <b>{{pred.par_jour}}</b> par jour en moyenne sur les 7 derniers jours confirmés.</p>
+<table><tr><th>Objectif</th><th>À ce rythme</th><th>Si tu doubles le rythme</th></tr>{% for c,a,b in pred.objectifs %}<tr><td>{{c|k}} abonnés</td><td>{{a}}</td><td>{{b}}</td></tr>{% endfor %}</table>
+{% elif perr2 %}<div class="msg">Prévision indisponible : {{perr2}}</div>{% endif %}
+<h2>Pourquoi certaines vidéos n’ont pas percé</h2>
 <p>Vidéos publiées depuis plus de 2 jours, comparées à tes meilleures. Seuil : {{seuil}} vues par jour.</p>
 {% if perr %}<div class="msg">Impossible d’analyser pour l’instant : {{perr}}</div>
 {% elif not d %}<div class="msg">Pas assez de vidéos publiées depuis plus de 2 jours pour analyser (il en faut au moins 4).</div>{% else %}
