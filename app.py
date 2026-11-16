@@ -909,6 +909,41 @@ def notif_bilan():
         txt = "Impossible de préparer le bilan : " + str(e)[:150]
     return redirect("/reglages?msg=" + urllib.parse.quote(txt))
 
+LEGAL = """<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{t}}</title><style>body{margin:0;background:#0b0b12;color:#f5f5f7;font:17px/1.6 -apple-system,BlinkMacSystemFont,"Helvetica Neue",sans-serif;padding:24px}
+main{max-width:720px;margin:0 auto}h1{font-size:1.8rem}h2{font-size:1.1rem;margin-top:1.6em}a{color:#5ab4ff}p,li{color:#d0d0d8}</style></head>
+<body><main>{{body|safe}}<p><a href="/a-propos">À propos</a> · <a href="/confidentialite">Confidentialité</a> · <a href="/conditions">Conditions</a></p></main></body></html>"""
+
+def _contact():
+    m = os.environ.get("CONTACT_EMAIL", "")
+    return f'Contact : <a href="mailto:{m}">{m}</a>.' if m else "Contact : le propriétaire du site."
+
+@app.route("/a-propos")
+def a_propos():
+    return render_template_string(LEGAL, t="Programmateur YouTube", body="""<h1>Programmateur YouTube</h1>
+<p>Outil personnel qui permet à son propriétaire de programmer ses vidéos YouTube Shorts, de suivre les statistiques de sa propre chaîne
+et de recevoir des notifications (stock de vidéos, bilan de la semaine). Il n’est pas destiné au grand public : l’accès est protégé par un mot de passe.</p>
+<p>""" + _contact() + "</p>")
+
+@app.route("/confidentialite")
+def confidentialite():
+    return render_template_string(LEGAL, t="Règles de confidentialité", body="""<h1>Règles de confidentialité</h1>
+<h2>Données utilisées</h2><p>Avec l’autorisation du propriétaire de la chaîne, l’application utilise son compte Google pour : envoyer et programmer des vidéos sur YouTube,
+lire la liste de ses vidéos et leurs statistiques (YouTube Data API et YouTube Analytics API), et envoyer des e-mails de notification à sa propre adresse (Gmail, envoi uniquement).</p>
+<h2>Stockage</h2><p>Les jetons d’accès au compte et les réglages (titres, hashtags, heures de publication) sont enregistrés dans une base de données privée (Upstash)
+et sur le serveur d’hébergement (Render), uniquement pour faire fonctionner l’application. Les vidéos envoyées ne sont pas conservées : elles sont transmises à YouTube puis supprimées du serveur.</p>
+<h2>Partage</h2><p>Aucune donnée n’est vendue ni partagée avec des tiers. Les titres des vidéos de la chaîne peuvent être envoyés à l’API Gemini de Google pour proposer de nouveaux titres.</p>
+<h2>Retirer l’accès</h2><p>L’accès peut être retiré à tout moment sur <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.
+Les données stockées peuvent être effacées sur simple demande.</p>
+<p>""" + _contact() + "</p>")
+
+@app.route("/conditions")
+def conditions():
+    return render_template_string(LEGAL, t="Conditions d’utilisation", body="""<h1>Conditions d’utilisation</h1>
+<p>Cette application est un outil personnel, fourni tel quel, sans garantie. Elle agit uniquement au nom de son propriétaire, sur sa propre chaîne YouTube,
+dans le respect des conditions d’utilisation de YouTube et des services d’API de Google. Les prévisions et statistiques affichées sont des estimations.</p>
+<p>""" + _contact() + "</p>")
+
 @app.route("/cron")
 def cron():
     k = os.environ.get("CRON_KEY", "")
