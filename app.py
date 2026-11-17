@@ -6,7 +6,7 @@ from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 app = Flask(__name__)
 app.secret_key = os.environ["SECRET_KEY"]
@@ -21,7 +21,8 @@ DATA = os.environ.get("DATA_DIR", "data")
 SCOPES = ["https://www.googleapis.com/auth/youtube",
           "https://www.googleapis.com/auth/youtube.upload",
           "https://www.googleapis.com/auth/youtube.readonly",
-          "https://www.googleapis.com/auth/yt-analytics.readonly"] + (
+          "https://www.googleapis.com/auth/yt-analytics.readonly",
+          "https://www.googleapis.com/auth/drive.readonly"] + (
     ["https://www.googleapis.com/auth/gmail.send"] if os.environ.get("NOTIF_EMAIL") else [])
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 os.makedirs(DATA + "/chaines", exist_ok=True)
@@ -104,7 +105,7 @@ def active():
 def _env(k): return [x.strip() for x in os.environ.get(k, "").split("|") if x.strip()]
 def config(cid):
     c = {"titres": _env("TITRES"), "oblig": OBLIG_TAGS, "pool": _env("HASHTAGS_TEST"),
-         "heures": DEFAUT_HEURES, "max_jour": 4, "apprentissage": True, "fond": "", "alerte_vues": 1000}
+         "heures": DEFAUT_HEURES, "max_jour": 4, "apprentissage": True, "fond": "", "alerte_vues": 1000, "flow_auto": False, "drive_auto": False, "drive_dossier": "Flow"}
     c.update((charger(cid) or {}).get("config", {}))
     if not c["oblig"]: c["oblig"] = OBLIG_TAGS
     return c
@@ -153,7 +154,7 @@ def historique(yt):
                         pub=datetime.fromisoformat(pub.replace("Z", "+00:00")),
                         vues=int(st.get("viewCount", 0)), likes=int(st.get("likeCount", 0)),
                         duree=duree_s(v.get("contentDetails", {}).get("duration")),
-                        statut=stt["privacyStatus"],
+                        statut=stt["privacyStatus"], sched=bool(stt.get("publishAt")),
                         img=s.get("thumbnails", {}).get("medium", {}).get("url", "")))
     return sorted(out, key=lambda v: v["pub"], reverse=True)
 
@@ -322,6 +323,22 @@ def generer_titres(hist, cfg, n):
     return out[:n], err
 
 JOBS = []
+DRIVE_INFO, DRIVE_PAUSE = {}, {}
+
+def prochain_9h():
+    """Le quota YouTube repart à zéro vers 9h (heure de Paris)."""
+    now = datetime.now(TZ); t = now.replace(hour=9, minute=5, second=0, microsecond=0)
+    return (t if t > now else t + timedelta(days=1)).timestamp()
+
+def _drive_etat(cid): return kv_get("drive:" + cid) or {"fait": [], "essais": {}}
+
+def drive_marquer(cid, fid):
+    d = _drive_etat(cid)
+    if fid not in d["fait"]: d["fait"] = (d["fait"] + [fid])[-1000:]
+    d["essais"].pop(fid, None); kv_set("drive:" + cid, d)
+
+def drive_essai(cid, fid):
+    d = _drive_etat(cid); d["essais"][fid] = d["essais"].get(fid, 0) + 1; kv_set("drive:" + cid, d)
 
 def signature(p):
     """Empreinte rapide d'un fichier : taille + début + fin (suffit à repérer un même fichier)."""
@@ -359,11 +376,13 @@ def traiter(cid, jobs):
                     st, resp = req.next_chunk()
                     if st: j["pct"] = int(st.progress() * 100)
                 v = yt.videos().list(part="status", id=resp["id"]).execute().get("items", [])
+                flow_marquer(cid, [resp["id"]])
                 if not v: raise Exception("YouTube ne retrouve pas la vidéo après l'envoi.")
                 stt = v[0]["status"]
                 warn = "" if stt.get("publishAt") else \
                     "YouTube n'a pas gardé la programmation (projet Google non validé) : la vidéo reste privée."
                 if j.get("sig"): noter_envoi(cid, j["sig"], j["nom"])
+                if j.get("drive_id"): drive_marquer(cid, j["drive_id"])
                 j.update(etat="ok", pct=100, vid=resp["id"], warn=warn,
                          quand=f"{when.astimezone(TZ):%d/%m à %Hh%M}")
                 hist.insert(0, dict(id=resp["id"], titre=j["titre"], desc=" ".join(tags), pub=when, vues=0, likes=0,
@@ -374,8 +393,10 @@ def traiter(cid, jobs):
                                                 "Réessaie demain vers 9h : envoie celle-ci à nouveau.")
                     for k in jobs:
                         if k["etat"] == "attente": k.update(etat="erreur", msg=j["msg"])
+                    DRIVE_PAUSE[cid] = prochain_9h()  # les fichiers restent dans le dossier Drive, on réessaiera après 9h
                     break
                 j.update(etat="erreur", msg=str(e)[:300])
+                if j.get("drive_id"): drive_essai(cid, j["drive_id"])
     except Exception as e:
         for j in jobs:
             if j["etat"] == "attente": j.update(etat="erreur", msg=str(e)[:300])
@@ -383,6 +404,100 @@ def traiter(cid, jobs):
         for j in jobs:
             if os.path.exists(j["path"]): os.unlink(j["path"])
         CACHE.pop(("h", cid), None); CACHE.pop(("hist", cid), None)
+
+# ---------- dossier Google Drive : tout ce qu'on y dépose est programmé tout seul ----------
+def drive_auto(cid, nom):
+    cfg = config(cid)
+    if not cfg.get("drive_auto"): return
+    if time.time() < DRIVE_PAUSE.get(cid, 0):
+        DRIVE_INFO[cid] = "En pause : limite d'envoi YouTube atteinte, reprise vers 9h. Tes vidéos restent dans le dossier."; return
+    dr = build("drive", "v3", credentials=creds_for(cid))
+    dossier = (cfg.get("drive_dossier") or "Flow").strip()
+    q = "mimeType='application/vnd.google-apps.folder' and trashed=false and name='" + dossier.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    r = dr.files().list(q=q, fields="files(id,name)", pageSize=5).execute().get("files", [])
+    if not r:
+        DRIVE_INFO[cid] = f"Dossier « {dossier} » introuvable dans ton Google Drive (vérifie le nom)."; return
+    fs = dr.files().list(q=f"'{r[0]['id']}' in parents and mimeType contains 'video/' and trashed=false",
+                         fields="files(id,name,size,createdTime)", orderBy="createdTime", pageSize=50).execute().get("files", [])
+    d = _drive_etat(cid); en_cours = {j.get("drive_id") for j in JOBS if j.get("etat") in ("attente", "envoi")}
+    abandon = [f for f in fs if d["essais"].get(f["id"], 0) >= 3 and f["id"] not in d["fait"]]
+    neufs = [f for f in fs if f["id"] not in d["fait"] and f["id"] not in en_cours and d["essais"].get(f["id"], 0) < 3]
+    DRIVE_INFO[cid] = (f"Dernière vérification à {datetime.now(TZ):%Hh%M} : {len(neufs)} nouvelle(s) vidéo(s) dans « {dossier} »."
+                       + (f" {len(abandon)} vidéo(s) abandonnée(s) après 3 échecs ({', '.join(f['name'] for f in abandon)[:80]})." if abandon else ""))
+    if neufs: threading.Thread(target=_drive_traiter, args=(cid, nom, neufs[:6]), daemon=True).start()
+
+def _drive_traiter(cid, nom, fichiers):
+    jobs = []
+    try:
+        dr = build("drive", "v3", credentials=creds_for(cid)); deja = {x["sig"] for x in deja_envoyes(cid)}
+        for f in fichiers:
+            p = os.path.join(tempfile.gettempdir(), uuid.uuid4().hex + ".mp4")
+            try:
+                with open(p, "wb") as fh:
+                    dl = MediaIoBaseDownload(fh, dr.files().get_media(fileId=f["id"]), chunksize=8 * 1024 * 1024); fini = False
+                    while not fini: _, fini = dl.next_chunk()
+                if os.path.getsize(p) == 0: raise Exception("fichier vide")
+                sig = signature(p)
+                if sig in deja:  # déjà publiée : on ne la renvoie pas
+                    drive_marquer(cid, f["id"]); os.unlink(p); continue
+                jobs.append(dict(sig=sig, nom=f["name"], path=p, etat="attente", pct=0, titre="", msg="", warn="", vid="", quand="", ia="", drive_id=f["id"]))
+            except Exception as e:
+                drive_essai(cid, f["id"])
+                if os.path.exists(p): os.unlink(p)
+        if jobs:
+            JOBS[:] = JOBS[-30:] + jobs
+            traiter(cid, jobs)
+            ok = [j for j in jobs if j["etat"] == "ok"]; ko = [j for j in jobs if j["etat"] != "ok"]
+            if moyens():
+                txt = "\n".join([f"{nom} : {len(ok)} vidéo(s) programmée(s) depuis ton dossier Drive."] + [f"• {j['titre'][:45]} ({j['quand']})" for j in ok]
+                                 + [f"Échec : {j['nom']} ({j['msg'][:60]})" for j in ko])
+                notifier("Vidéos programmées depuis Drive", txt, cid)
+    except Exception as e:
+        DRIVE_INFO[cid] = "Problème : " + erreur_claire(e)[0]
+        for j in jobs:
+            if os.path.exists(j["path"]): os.unlink(j["path"])
+
+# ---------- vidéos venues de Google Flow ----------
+FLOW_INFO = {}
+
+def _flow_ids(cid): return kv_get("flow:" + cid) or {"ids": [], "base": False}
+
+def flow_marquer(cid, ids):
+    """Vidéos déjà traitées (ou envoyées par le site) : le pont Flow n'y touche jamais."""
+    d = _flow_ids(cid); d["ids"] = (d["ids"] + [i for i in ids if i not in d["ids"]])[-1000:]; kv_set("flow:" + cid, d)
+
+def flow_auto(cid, nom):
+    """Une vidéo envoyée en privé depuis Flow (moins de 24 h, pas programmée) reçoit un titre IA, 15 hashtags et un créneau."""
+    cfg = config(cid)
+    if not cfg.get("flow_auto"): return []
+    yt = yt_for(cid); hist = historique(yt); d = _flow_ids(cid); now = datetime.now(timezone.utc)
+    age = lambda v: (now - v["pub"]).total_seconds() / 3600
+    if not d["base"]:  # 1re vérification : tout ce qui existe déjà est mis de côté, on ne touche qu'aux NOUVELLES vidéos
+        d["ids"] = list(dict.fromkeys(d["ids"] + [v["id"] for v in hist if age(v) > 0.25 or v["pub"] > now])); d["base"] = True
+        kv_set("flow:" + cid, d); FLOW_INFO[cid] = "Activé. Surveille les nouvelles vidéos privées envoyées depuis Flow."; return []
+    cand = [v for v in hist if v["statut"] == "private" and not v.get("sched") and v["id"] not in d["ids"]
+            and 0 < v["duree"] <= 180 and 0 < age(v) <= 24]
+    FLOW_INFO[cid] = f"Dernière vérification à {datetime.now(TZ):%Hh%M} : {len(cand)} vidéo(s) à programmer."
+    if not cand: return []
+    occ = occupation(hist); titres, _ = generer_titres(hist, cfg, len(cand)); faits = []
+    for v, titre in zip(cand, titres):
+        try:
+            it = yt.videos().list(part="snippet,status", id=v["id"]).execute()["items"][0]
+            sn, st = it["snippet"], it["status"]
+            _, tags, when, _ = choisir(hist, cfg, occ)
+            titre = re.sub(r"[<>]", "", titre)[:100]
+            snippet = {"title": titre, "description": " ".join(tags), "categoryId": sn.get("categoryId", "22")}
+            for k in ("tags", "defaultLanguage"):
+                if sn.get(k): snippet[k] = sn[k]
+            statut = {k: st[k] for k in ("embeddable", "license", "publicStatsViewable") if k in st}
+            statut.update(privacyStatus="private", publishAt=when.strftime("%Y-%m-%dT%H:%M:%S.000Z"), selfDeclaredMadeForKids=False)
+            yt.videos().update(part="snippet,status", body={"id": v["id"], "snippet": snippet, "status": statut}).execute()
+            flow_marquer(cid, [v["id"]])
+            hist.insert(0, dict(v, titre=titre, desc=" ".join(tags), pub=when, sched=True))
+            faits.append(f"{nom} : « {titre[:50]} » programmée le {when.astimezone(TZ):%d/%m à %Hh%M}")
+        except Exception as e:
+            FLOW_INFO[cid] = "Problème : " + erreur_claire(e)[0]
+    return faits
 
 SOURCES = {"SHORTS": "Shorts", "YT_SEARCH": "Recherche YouTube", "SUGGESTED_VIDEO": "Vidéos suggérées",
            "BROWSE": "Accueil YouTube", "EXT_URL": "Sites externes", "NO_LINK_OTHER": "Direct / autre",
@@ -708,6 +823,15 @@ def verifier():
 
 def _verifier():
     """Alerte stock bas (8h-22h, au plus toutes les 12 h) + bilan le vendredi soir (dès 18h, une fois)."""
+    for cid, nom in liste():
+        try: drive_auto(cid, nom)
+        except Exception as e: DRIVE_INFO[cid] = "Problème : " + erreur_claire(e)[0]
+        try:
+            faits = flow_auto(cid, nom)
+            if faits:
+                CACHE.pop(("h", cid), None); CACHE.pop(("hist", cid), None)
+                if moyens(): notifier("Vidéo(s) de Flow programmée(s)", "\n".join(faits), cid)
+        except Exception as e: FLOW_INFO[cid] = "Problème : " + erreur_claire(e)[0]
     if not moyens(): return
     now = datetime.now(TZ); etat = lire_etat(); mini = int(os.environ.get("NOTIF_JOURS", "1"))
     for cid, nom in liste():
@@ -1140,16 +1264,20 @@ def reglages():
     if request.method == "POST":
         f = request.form
         sp = lambda s: [x.strip() for x in re.split(r"[,\n]", s) if x.strip()]
-        d = charger(cid)
+        d = charger(cid); avant = config(cid).get("flow_auto")
+        if f.get("flow_auto") and not avant:  # on (ré)active : on repart d'une base propre
+            fl = _flow_ids(cid); fl["base"] = False; kv_set("flow:" + cid, fl)
         d["config"] = {"titres": [x.strip() for x in f["titres"].splitlines() if x.strip()],
                        "oblig": sp(f["oblig"]) or OBLIG_TAGS, "pool": sp(f["pool"]),
                        "heures": [int(x) for x in sp(f["heures"]) if x.isdigit() and int(x) < 24] or DEFAUT_HEURES,
                        "max_jour": max(1, min(10, (int(f["max_jour"]) if f.get("max_jour", "").strip().isdigit() else 4))), "fond": f.get("fond", "").strip(),
                        "apprentissage": bool(f.get("apprentissage")),
-                       "alerte_vues": int(f["alerte_vues"]) if f.get("alerte_vues", "").strip().isdigit() else 1000}
+                       "alerte_vues": int(f["alerte_vues"]) if f.get("alerte_vues", "").strip().isdigit() else 1000,
+                       "flow_auto": bool(f.get("flow_auto")), "drive_auto": bool(f.get("drive_auto")),
+                       "drive_dossier": f.get("drive_dossier", "").strip()[:100] or "Flow"}
         sauver(cid, d)
         return redirect("/reglages?msg=Réglages enregistrés.")
-    return vue("reglages", c=config(cid), notif=moyens(), stockage=etat_stockage())
+    return vue("reglages", c=config(cid), notif=moyens(), stockage=etat_stockage(), flow=FLOW_INFO.get(cid), drive=DRIVE_INFO.get(cid))
 
 PAGE = """{% macro semaine(sem, mx) %}<div class="g wk"><h3>LES 7 PROCHAINS JOURS <em>{{mx}} / jour</em></h3><div class="wd">{% for s in sem %}<div class="dy {{'td' if loop.first}}"><small>{{s.lab}}</small><b>{{s.jour.day}}</b><i class="dots">{% for x in range(mx) %}<u class="{{'f' if x<s.n}}"></u>{% endfor %}</i>{% for h in s.heures %}<span>{{h}}</span>{% endfor %}</div>{% endfor %}</div></div>{% endmacro %}
 <!doctype html><html lang="fr"><head><meta charset="utf-8">
@@ -1377,6 +1505,9 @@ load();setInterval(load,3000);
 <label>Alerte « ça décolle » : vues en 24 h pour être prévenu (0 = pas d'alerte)</label><input name="alerte_vues" type="number" min="0" value="{{c.alerte_vues}}">
 <label>Image de fond (lien, facultatif)</label><input name="fond" value="{{c.fond}}" placeholder="https://…">
 <label class="chk"><input type="checkbox" name="apprentissage" {{'checked' if c.apprentissage}}> Apprendre de mes résultats</label>
+<label class="chk"><input type="checkbox" name="drive_auto" {{'checked' if c.drive_auto}}> Publier automatiquement les vidéos que je dépose dans mon dossier Google Drive</label>
+<label>Nom du dossier Google Drive</label><input name="drive_dossier" value="{{c.drive_dossier}}" placeholder="Flow">{% if drive %}<p class="mut" style="font-size:.85rem">{{drive}}</p>{% endif %}
+<label class="chk"><input type="checkbox" name="flow_auto" {{'checked' if c.flow_auto}}> Programmer automatiquement les vidéos envoyées depuis Google Flow (en privé, de moins de 24 h)</label>{% if flow %}<p class="mut" style="font-size:.85rem">{{flow}}</p>{% endif %}
 <button>Enregistrer</button></form>
 <h2>Notifications</h2><div class="g box"><p>Moyens actifs : {{notif|join(', ') if notif else 'aucun (voir les variables sur Render)'}}.</p>
 <p style="font-size:.85rem">Alerte quand le stock est bas, et bilan de la semaine chaque vendredi dès 18h.</p>
