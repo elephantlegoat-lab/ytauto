@@ -18,7 +18,8 @@ app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=BASE.star
                   PERMANENT_SESSION_LIFETIME=timedelta(days=30))
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Paris"))
 DATA = os.environ.get("DATA_DIR", "data")
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
+SCOPES = ["https://www.googleapis.com/auth/youtube",
+          "https://www.googleapis.com/auth/youtube.upload",
           "https://www.googleapis.com/auth/youtube.readonly",
           "https://www.googleapis.com/auth/yt-analytics.readonly"] + (
     ["https://www.googleapis.com/auth/gmail.send"] if os.environ.get("NOTIF_EMAIL") else [])
@@ -52,7 +53,7 @@ def _fichier(cle):
 
 def kv_get(cle):
     t, v = _MEM.get(cle, (0, None))
-    if v is not None and time.time() - t < 30: return json.loads(v)
+    if v is not None and time.time() - t < 120: return json.loads(v)
     if REDIS:
         try:
             raw = _redis("GET", cle)
@@ -110,7 +111,7 @@ def config(cid):
 
 def creds_for(cid):
     d = charger(cid)
-    c = Credentials.from_authorized_user_info(json.loads(d["token"]), SCOPES)
+    c = Credentials.from_authorized_user_info(json.loads(d["token"]))
     if not c.valid and c.refresh_token:
         c.refresh(Request())
         d["token"] = c.to_json(); sauver(cid, d)
@@ -381,7 +382,7 @@ def traiter(cid, jobs):
     finally:
         for j in jobs:
             if os.path.exists(j["path"]): os.unlink(j["path"])
-        CACHE.pop(("h", cid), None)
+        CACHE.pop(("h", cid), None); CACHE.pop(("hist", cid), None)
 
 SOURCES = {"SHORTS": "Shorts", "YT_SEARCH": "Recherche YouTube", "SUGGESTED_VIDEO": "Vidéos suggérées",
            "BROWSE": "Accueil YouTube", "EXT_URL": "Sites externes", "NO_LINK_OTHER": "Direct / autre",
@@ -535,6 +536,37 @@ def cache(cle, ttl, fn):
     if v is not None and time.time() - t < ttl: return v
     v = fn(); CACHE[cle] = (time.time(), v); return v
 
+_REFRESH = set()
+
+def cache_sr(cle, ttl, fn, vieux=1800):
+    """Réponse instantanée : on donne tout de suite ce qu'on a en mémoire (même un peu ancien)
+    et on le rafraîchit en arrière-plan. Au-delà de `vieux` secondes, on recalcule pour de bon."""
+    t, v = CACHE.get(cle, (0, None))
+    if v is None or time.time() - t > vieux:
+        v = fn(); CACHE[cle] = (time.time(), v); return v
+    if time.time() - t >= ttl and cle not in _REFRESH:
+        _REFRESH.add(cle)
+        def maj():
+            try: CACHE[cle] = (time.time(), fn())
+            except Exception: pass
+            finally: _REFRESH.discard(cle)
+        threading.Thread(target=maj, daemon=True).start()
+    return v
+
+def hist_de(cid, ttl=60):
+    return cache_sr(("hist", cid), ttl, lambda: historique(yt_for(cid)))
+
+_CHAUF = threading.Lock()
+
+def chauffer():
+    """Prépare à l'avance les données de l'accueil : les pages s'ouvrent alors tout de suite."""
+    if not _CHAUF.acquire(blocking=False): return
+    try:
+        for cid, _ in liste():
+            try: CACHE[("h", cid)] = (time.time(), donnees_chaine(cid))
+            except Exception: pass
+    finally: _CHAUF.release()
+
 @app.after_request
 def pas_de_cache(r):
     if r.mimetype == "text/html": r.headers["Cache-Control"] = "no-store"
@@ -566,19 +598,26 @@ def vues_28j(cid):
     return rows[0][0] if rows else 0
 
 def donnees_chaine(cid):
-    """Tout ce qu'il faut pour l'accueil d'une chaîne."""
-    yt, cfg = yt_for(cid), config(cid)
-    hist = historique(yt)
-    ch = yt.channels().list(part="snippet,statistics", mine=True).execute()["items"][0]
+    """Tout ce qu'il faut pour l'accueil d'une chaîne (les appels à Google partent en même temps)."""
+    from concurrent.futures import ThreadPoolExecutor
+    cfg = config(cid)
+    creds_for(cid)  # rafraîchit le jeton une seule fois avant de partir en parallèle
+    def t_hist(): return historique(yt_for(cid))
+    def t_chaine(): return yt_for(cid).channels().list(part="snippet,statistics", mine=True).execute()["items"][0]
+    def t_28j():
+        try: return vues_28j(cid)
+        except Exception: return None
+    def t_recent():
+        try: return recent(cid, yt_for(cid))
+        except Exception: return None
+    with ThreadPoolExecutor(4) as ex:
+        fs = [ex.submit(f) for f in (t_hist, t_chaine, t_28j, t_recent)]
+        hist, ch, v28, r = [f.result() for f in fs]
+    CACHE[("hist", cid)] = (time.time(), hist)
     st = ch["statistics"]; now = datetime.now(timezone.utc); aujourd = datetime.now(TZ).date()
     loc = lambda v: v["pub"].astimezone(TZ)
     futur = sorted((v for v in hist if v["pub"] > now), key=lambda v: v["pub"])
-    try: v28 = vues_28j(cid)
-    except Exception: v28 = None
-    try:
-        r = recent(cid, yt)
-        if v28 is not None and r: v28 += r["est"]
-    except Exception: pass
+    if v28 is not None and r: v28 += r["est"]
     def jour_txt(d): return "aujourd’hui" if d == aujourd else "demain" if d == aujourd + timedelta(days=1) else f"{d:%d/%m}"
     sem = []
     for i in range(7):
@@ -589,7 +628,7 @@ def donnees_chaine(cid):
     return dict(cid=cid, nom=ch["snippet"]["title"], img=ch["snippet"]["thumbnails"].get("default", {}).get("url", ""),
                 abos=int(st.get("subscriberCount", 0)), vues=int(st.get("viewCount", 0)), vues28=v28,
                 aujourd=sum(1 for v in hist if loc(v).date() == aujourd), max=int(cfg["max_jour"]), prog=len(futur), sem=sem, stock=stock(hist, cfg),
-                futur=[dict(titre=v["titre"], quand=loc(v), iso=v["pub"].isoformat(), jour=jour_txt(loc(v).date())) for v in futur[:6]])
+                futur=[dict(titre=v["titre"], quand=loc(v), iso=v["pub"].isoformat(), jour=jour_txt(loc(v).date()), id=v["id"], cid=cid) for v in futur[:6]])
 
 def stock(hist, cfg):
     """Combien de jours de vidéos programmées il reste."""
@@ -701,6 +740,7 @@ def boucle():
     while True:
         try: verifier()
         except Exception: pass
+        chauffer()
         time.sleep(600)
 
 MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
@@ -816,6 +856,8 @@ def erreur_claire(e):
     t = str(e)
     if any(x in t for x in ("invalid_grant", "RefreshError", "expired or revoked", "invalid_client", "unauthorized_client")):
         return "Google a retiré ou fait expirer l'autorisation de cette chaîne.", True
+    if "insufficient" in t.lower() and ("scope" in t.lower() or "permission" in t.lower()):
+        return "Il manque une autorisation Google : reconnecte la chaîne (bouton « + Chaîne »), puis recommence.", True
     if "quotaExceeded" in t or "rateLimitExceeded" in t: return "Limite quotidienne de YouTube atteinte : ça repart vers 9h.", False
     if "accessNotConfigured" in t or "has not been used" in t: return "Une API Google n'est pas activée dans Google Cloud.", False
     if any(x in t for x in ("timed out", "Connection", "Name or service", "SSL")): return "Google ne répond pas pour l'instant. Réessaie dans un moment.", False
@@ -827,7 +869,7 @@ def home():
     if request.args.get("maj"): CACHE.clear()
     data, erreurs = [], []
     for c, nom in liste():
-        try: data.append(cache(("h", c), 20, lambda c=c: donnees_chaine(c)))
+        try: data.append(cache_sr(("h", c), 60, lambda c=c: donnees_chaine(c)))
         except Exception as e:
             txt, reco = erreur_claire(e); erreurs.append(dict(nom=nom, txt=txt, reco=reco))
     prog = sorted(((f, d["nom"]) for d in data for f in d["futur"]), key=lambda x: x[0]["quand"])
@@ -841,7 +883,7 @@ def publier():
     cid = active(); sem = stk = None
     if cid:
         try:
-            d = cache(("h", cid), 20, lambda: donnees_chaine(cid)); sem, stk = d["sem"], d["stock"]
+            d = cache_sr(("h", cid), 60, lambda: donnees_chaine(cid)); sem, stk = d["sem"], d["stock"]
         except Exception: pass
     return vue("publier", c=config(cid) if cid else {"max_jour": 4}, sem=sem, stk=stk)
 
@@ -897,6 +939,28 @@ def upload():
     threading.Thread(target=traiter, args=(cid, jobs), daemon=True).start()
     return redirect("/file")
 
+@app.route("/publier-maintenant/<cid>/<vid>", methods=["POST"])
+@authed
+def publier_maintenant(cid, vid):
+    retour = request.form.get("retour", "/")
+    if not retour.startswith("/") or retour.startswith("//"): retour = "/"
+    def fin(msg): return redirect(retour + ("&" if "?" in retour else "?") + "msg=" + urllib.parse.quote(msg))
+    if cid not in [c for c, _ in liste()] or not re.fullmatch(r"[\w-]{6,20}", vid): return fin("Vidéo introuvable.")
+    try:
+        yt = yt_for(cid)
+        it = yt.videos().list(part="status,snippet", id=vid).execute().get("items", [])
+        if not it or it[0]["snippet"].get("channelId") != cid: return fin("Vidéo introuvable sur cette chaîne.")
+        titre, st = it[0]["snippet"]["title"], it[0]["status"]
+        if st["privacyStatus"] == "public": return fin("Cette vidéo est déjà publique.")
+        statut = {k: st[k] for k in ("embeddable", "license", "publicStatsViewable", "selfDeclaredMadeForKids") if k in st}
+        statut["privacyStatus"] = "public"  # sans publishAt : la programmation est annulée, la vidéo sort tout de suite
+        yt.videos().update(part="status", body={"id": vid, "status": statut}).execute()
+        CACHE.pop(("h", cid), None); CACHE.pop(("hist", cid), None)
+        return fin("Publiée maintenant : " + titre[:60])
+    except Exception as e:
+        txt, reco = erreur_claire(e)
+        return fin("Impossible de publier : " + txt)
+
 @app.route("/file")
 @authed
 def file():
@@ -922,13 +986,13 @@ def diagnostic():
     except ValueError: seuil = 1500
     d = perr = pred = perr2 = None
     try:
-        yt = yt_for(cid); hist = historique(yt)
+        yt = yt_for(cid); hist = hist_de(cid)
     except Exception as e:
         hist = None; perr = perr2 = str(e)[:300]
     if hist is not None:
-        try: d = analyser(hist, retention(cid), seuil)
+        try: d = analyser(hist, cache(("ret", cid), 300, lambda: retention(cid)), seuil)
         except Exception as e: perr = str(e)[:300]
-        try: pred = prevision(cid, yt, hist)
+        try: pred = cache(("prev", cid), 300, lambda: prevision(cid, yt, hist))
         except Exception as e: perr2 = str(e)[:200]
     ia = err = None
     if d and request.args.get("ia"):
@@ -952,7 +1016,7 @@ def cal():
         a, mo = datetime.now(TZ).year, datetime.now(TZ).month
     m = f"{a}-{mo:02d}"
     jours = {}
-    for v in historique(yt_for(cid)):
+    for v in hist_de(cid):
         jours.setdefault(v["pub"].astimezone(TZ).date(), []).append(v)
     sem = calendar.Calendar().monthdatescalendar(a, mo)
     prec = (datetime(a, mo, 1) - timedelta(days=1)).strftime("%Y-%m")
@@ -969,7 +1033,7 @@ def cal():
 def biblio():
     cid = active()
     if not cid: return redirect("/")
-    return vue("biblio", vids=historique(yt_for(cid)), tz=TZ, now=datetime.now(timezone.utc))
+    return vue("biblio", vids=hist_de(cid), tz=TZ, now=datetime.now(timezone.utc))
 
 @app.route("/stats")
 @authed
@@ -977,15 +1041,15 @@ def stats():
     cid = active()
     if not cid: return redirect("/")
     j = request.args.get("j", "28"); j = int(j) if j in ("7", "28", "90") else 28
-    yt = yt_for(cid); v = mesurees(historique(yt))
+    yt = yt_for(cid); v = mesurees(hist_de(cid))
     top = lambda cles: sorted(((k, n, round(m, 2)) for k, (n, m) in stats_par(v, cles).items()),
                               key=lambda x: -x[2])[:6]
     an, err, mon = None, None, None
-    try: an = analytique(cid, yt, j)
+    try: an = cache(("an", cid, j), 300, lambda: analytique(cid, yt, j))
     except Exception as e: err = str(e)[:260]
-    try: mon = barres(monetisation(cid, yt))
+    try: mon = barres(cache(("mon", cid), 600, lambda: monetisation(cid, yt)))
     except Exception: pass
-    try: fr = recent(cid, yt)
+    try: fr = cache(("rec", cid), 300, lambda: recent(cid, yt))
     except Exception: fr = None
     return vue("stats", j=j, an=an, err=err, mon=mon, fr=fr, maj=datetime.now(TZ).strftime("%H:%M"), nm=len(v), mini=MIN_APPRENTISSAGE,
                heures=top(lambda x: [f"{heure_de(x)}h"]), titres=top(lambda x: [x["titre"]]),
@@ -1065,6 +1129,7 @@ def cron():
     if not k or not hmac.compare_digest(request.args.get("key", ""), k): return "non", 403
     try: verifier()
     except Exception as e: return f"erreur : {e}", 500
+    threading.Thread(target=chauffer, daemon=True).start()
     return "ok"
 
 @app.route("/reglages", methods=["GET", "POST"])
@@ -1108,7 +1173,7 @@ input,textarea{width:100%;font:inherit;color:var(--ink);padding:13px 15px;border
 input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--tint)}textarea{min-height:90px;resize:vertical}
 button,.btn{display:block;width:100%;margin-top:1.4em;padding:15px;font:inherit;font-weight:600;color:#fff;background:linear-gradient(180deg,rgba(255,110,70,.55),rgba(255,70,40,.4));border:1px solid rgba(255,255,255,.25);
 box-shadow:inset 0 1px 0 rgba(255,255,255,.3);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);border-radius:18px;text-align:center;cursor:pointer;transition:transform .18s cubic-bezier(.2,.8,.2,1),filter .2s}
-button:active,.btn:active,.tile:active,.dock a:active,.pill:active{transform:scale(.95)}button:disabled{opacity:.55}
+button.pn{display:inline-block;width:auto;margin-top:8px;padding:7px 14px;font-size:.78rem}button:active,.btn:active,.tile:active,.dock a:active,.pill:active{transform:scale(.95)}button:disabled{opacity:.55}
 .top{position:sticky;top:max(8px,env(safe-area-inset-top));z-index:10;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 14px;border-radius:999px;margin-bottom:14px}
 .logo{display:flex;width:34px;height:34px;border-radius:11px;background:linear-gradient(180deg,#ff4d3a,#d81f10);align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(255,60,40,.5)}.logo svg{width:16px;height:16px}
 .st{font-size:1rem;margin-right:4px}.pills{display:flex;gap:8px;flex-wrap:wrap}.sp{flex:1}
@@ -1173,7 +1238,8 @@ table{width:100%;border-collapse:separate;border-spacing:0;border-radius:20px;ov
 <div class="g big"><div><span id="gr" class="mut"></span><div class="tm"><b id="hm">--:--</b><sup id="sc"></sup></div><div class="dt" id="dt"></div>
 {% for d in data %}<div class="stk2"><b>{{d.nom}}</b> · {{d.stock.videos}} vidéo(s) en stock{% if d.stock.videos %} · de quoi tenir <b>{{d.stock.jours}} jour(s)</b> (jusqu’au {{d.stock.dernier.strftime('%d/%m')}}){% else %} · plus rien de programmé !{% endif %}</div>{% endfor %}
 <div class="chips"><span>{{n_prog}} programmée(s)</span><span>{{n_att}} en attente</span><span>{{chaines|length}} chaîne(s)</span></div></div>
-<div class="ap"><h3>AU PROGRAMME</h3>{% for f,nom in prog %}<div class="ai"><b>{{f.quand.strftime('%H:%M')}}</b><div>{{f.titre[:36]}}<br><span class="mut">{{nom}} · {{f.jour}}</span></div></div>{% else %}<p>Rien de programmé pour l’instant.</p>{% endfor %}</div></div></div>
+<div class="ap"><h3>AU PROGRAMME</h3>{% for f,nom in prog %}<div class="ai"><b>{{f.quand.strftime('%H:%M')}}</b><div>{{f.titre[:36]}}<br><span class="mut">{{nom}} · {{f.jour}}</span>
+<form method="post" action="/publier-maintenant/{{f.cid}}/{{f.id}}" onsubmit="return confirm('Publier cette vidéo tout de suite ?')"><input type="hidden" name="retour" value="/"><button class="pn">Publier maintenant</button></form></div></div>{% else %}<p>Rien de programmé pour l’instant.</p>{% endfor %}</div></div></div>
 <div class="tiles">{% for u,l,i in [('/publier','Publier','upload'),('/stats','Analytique','chart'),('/calendrier','Calendrier','cal'),('/bibliotheque','Bibliothèque','grid'),('/diagnostic','Diagnostic','search'),('/reglages','Réglages','sliders')] %}
 <a class="tile" href="{{u}}"><span><svg viewBox="0 0 24 24">{{ICONS[i]|safe}}</svg></span>{{l}}</a>{% endfor %}</div>
 <div class="chs">{% for d in data %}<div class="g"><div class="cch"><img src="{{d.img}}" alt=""><div><b>{{d.nom}}</b><br><span class="mut">{{d.abos}} abonnés · {{d.vues|k}} vues au total</span></div>
@@ -1221,7 +1287,8 @@ var t=document.querySelector('.today')||document.querySelector('.d:not(.out)');i
 </script>
 {% elif view=='biblio' %}
 <h1>Bibliothèque</h1><div class="grid">{% for v in vids %}<div class="v"><img src="{{v.img}}" alt=""><div><b>{{v.titre}}</b><br>
-<span class="mut">{{v.vues}} vues · {{v.likes}} j’aime<br>{{'Programmée' if v.pub>now else v.statut}} · {{v.pub.astimezone(tz).strftime('%d/%m %Hh')}}</span></div></div>{% endfor %}</div>
+<span class="mut">{{v.vues}} vues · {{v.likes}} j’aime<br>{{'Programmée' if v.pub>now else v.statut}} · {{v.pub.astimezone(tz).strftime('%d/%m %Hh')}}</span>
+{% if v.statut!='public' %}<form method="post" action="/publier-maintenant/{{cid}}/{{v.id}}" onsubmit="return confirm('Publier cette vidéo tout de suite ?')"><input type="hidden" name="retour" value="/bibliotheque"><button class="pn">Publier maintenant</button></form>{% endif %}</div></div>{% endfor %}</div>
 {% elif view=='stats' %}
 <div class="ch"><h1>Stats</h1><div>{% for d in [7,28,90] %}<a class="{{'on' if j==d}}" href="/stats?j={{d}}">{{d}} j</a>{% endfor %}</div></div>
 {% if fr %}<div class="msg">Dernier jour confirmé par YouTube : <b>{{fr.dernier}}</b>{% if fr.jours>0 %} ({{fr.jours}} j de retard côté YouTube){% endif %}. Depuis, environ <b>+{{fr.est|k}} vues</b> en direct (estimation). Actualisé à {{maj}}.</div>{% else %}<p>Actualisé à {{maj}}. YouTube confirme ses chiffres détaillés avec 2 à 3 jours de retard.</p>{% endif %}
