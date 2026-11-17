@@ -368,6 +368,12 @@ def traiter(cid, jobs):
                 hist.insert(0, dict(id=resp["id"], titre=j["titre"], desc=" ".join(tags), pub=when, vues=0, likes=0,
                                     duree=0, statut="private", img=""))
             except Exception as e:
+                if "quotaExceeded" in str(e) or "uploadLimitExceeded" in str(e):
+                    j.update(etat="erreur", msg="Limite d'envoi YouTube atteinte pour aujourd'hui (environ 6 vidéos par jour). "
+                                                "Réessaie demain vers 9h : envoie celle-ci à nouveau.")
+                    for k in jobs:
+                        if k["etat"] == "attente": k.update(etat="erreur", msg=j["msg"])
+                    break
                 j.update(etat="erreur", msg=str(e)[:300])
     except Exception as e:
         for j in jobs:
@@ -654,7 +660,14 @@ def bilan_texte(cid, nom, yt, hist, cfg):
 def lire_etat():
     return kv_get("notif") or {}
 
+_VERIF = threading.Lock()
+
 def verifier():
+    if not _VERIF.acquire(blocking=False): return  # une vérification tourne déjà : on évite les doubles notifications
+    try: _verifier()
+    finally: _VERIF.release()
+
+def _verifier():
     """Alerte stock bas (8h-22h, au plus toutes les 12 h) + bilan le vendredi soir (dès 18h, une fois)."""
     if not moyens(): return
     now = datetime.now(TZ); etat = lire_etat(); mini = int(os.environ.get("NOTIF_JOURS", "1"))
@@ -769,13 +782,15 @@ def login():
     err = ""
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
     n, t = LOGIN_FAILS.get(ip, (0, 0))
-    if n >= 5 and time.time() - t < 600:
+    gn, gt = LOGIN_FAILS.get("*", (0, 0))
+    if (n >= 5 and time.time() - t < 600) or (gn >= 25 and time.time() - gt < 600):
         err = "Trop d’essais. Réessaie dans 10 minutes."
     elif request.method == "POST":
         if hmac.compare_digest(request.form.get("pw", "").encode(), PASSWORD.encode()):
             LOGIN_FAILS.pop(ip, None); session.permanent = True; session["ok"] = True
             return redirect("/")
         LOGIN_FAILS[ip] = ((n + 1) if time.time() - t < 600 else 1, time.time())
+        LOGIN_FAILS["*"] = ((gn + 1) if time.time() - gt < 600 else 1, time.time())
         err = "Mot de passe incorrect."
     return render_template_string(PAGE, view="login", err=err, chaines=[], cid=None, msg=None)
 
@@ -832,7 +847,7 @@ def callback():
     d.update(nom=ch["snippet"]["title"], token=f.credentials.to_json())
     sauver(ch["id"], d)
     session["cid"] = ch["id"]
-    return redirect("/?msg=Chaîne connectée : " + ch["snippet"]["title"])
+    return redirect("/?msg=" + urllib.parse.quote("Chaîne connectée : " + ch["snippet"]["title"]))
 
 @app.route("/upload", methods=["POST"])
 @authed
