@@ -103,7 +103,7 @@ def active():
 def _env(k): return [x.strip() for x in os.environ.get(k, "").split("|") if x.strip()]
 def config(cid):
     c = {"titres": _env("TITRES"), "oblig": OBLIG_TAGS, "pool": _env("HASHTAGS_TEST"),
-         "heures": DEFAUT_HEURES, "max_jour": 4, "apprentissage": True, "fond": ""}
+         "heures": DEFAUT_HEURES, "max_jour": 4, "apprentissage": True, "fond": "", "alerte_vues": 1000}
     c.update((charger(cid) or {}).get("config", {}))
     if not c["oblig"]: c["oblig"] = OBLIG_TAGS
     return c
@@ -679,6 +679,16 @@ def _verifier():
                 msg = (f"{nom} : plus aucune vidéo programmée. Ajoutes-en sur le site." if not s["videos"] else
                        f"{nom} : stock bas. Demain : {s['demain']}/{s['max']} vidéos. Stock total : {s['videos']} vidéo(s), {s['jours']} jour(s). Ajoutes-en sur le site.")
                 if any(ok for _, ok, _ in notifier("Pense à ajouter des vidéos", msg, cid)): etat[cle] = time.time()
+            al = int(cfg.get("alerte_vues", 1000) or 0)
+            if al > 0 and 8 <= now.hour < 23:  # vidéo publiée il y a 30 min à 24 h, au-dessus du seuil, prévenue une seule fois
+                boom = etat.setdefault("boom", {})
+                for v in hist:
+                    h = (datetime.now(timezone.utc) - v["pub"]).total_seconds() / 3600
+                    if v["statut"] == "public" and 0.5 <= h <= 24 and v["vues"] >= al and v["id"] not in boom:
+                        t = v["titre"] if len(v["titre"]) <= 50 else v["titre"][:49] + "…"
+                        msg = f"« {t} » décolle : {v['vues']} vues en {int(h)} h (ton seuil : {al}). Va voir les stats !"
+                        if any(ok for _, ok, _ in notifier("🚀 Une vidéo décolle", msg, cid)): boom[v["id"]] = time.time()
+                for k in [k for k, t0 in boom.items() if time.time() - t0 > 3 * 86400]: del boom[k]
             cle = f"bilan:{cid}"
             if now.weekday() == 4 and now.hour >= 18 and etat.get(cle) != str(now.date()):
                 if any(ok for _, ok, _ in notifier(f"Bilan de la semaine — {nom}", bilan_texte(cid, nom, yt, hist, cfg), cid)):
@@ -801,17 +811,28 @@ def canal(cid):
     r = request.args.get("retour", "/")
     return redirect(r if r.startswith("/") and not r.startswith("//") else "/")
 
+def erreur_claire(e):
+    """Traduit une erreur Google en phrase simple. Retourne (texte, faut_il_reconnecter)."""
+    t = str(e)
+    if any(x in t for x in ("invalid_grant", "RefreshError", "expired or revoked", "invalid_client", "unauthorized_client")):
+        return "Google a retiré ou fait expirer l'autorisation de cette chaîne.", True
+    if "quotaExceeded" in t or "rateLimitExceeded" in t: return "Limite quotidienne de YouTube atteinte : ça repart vers 9h.", False
+    if "accessNotConfigured" in t or "has not been used" in t: return "Une API Google n'est pas activée dans Google Cloud.", False
+    if any(x in t for x in ("timed out", "Connection", "Name or service", "SSL")): return "Google ne répond pas pour l'instant. Réessaie dans un moment.", False
+    return t.replace("\n", " ")[:140] or "Erreur inconnue.", False
+
 @app.route("/")
 @authed
 def home():
     if request.args.get("maj"): CACHE.clear()
-    data = []
-    for c, _ in liste():
+    data, erreurs = [], []
+    for c, nom in liste():
         try: data.append(cache(("h", c), 20, lambda c=c: donnees_chaine(c)))
-        except Exception: pass
+        except Exception as e:
+            txt, reco = erreur_claire(e); erreurs.append(dict(nom=nom, txt=txt, reco=reco))
     prog = sorted(((f, d["nom"]) for d in data for f in d["futur"]), key=lambda x: x[0]["quand"])
     acc = next((d for d in data if d["cid"] == active()), data[0] if data else None)
-    return vue("home", data=data, prog=prog[:5], nxt=prog[0] if prog else None, act=list(reversed(JOBS[-8:])), acc=acc,
+    return vue("home", data=data, erreurs=erreurs, prog=prog[:5], nxt=prog[0] if prog else None, act=list(reversed(JOBS[-8:])), acc=acc,
                n_prog=sum(d["prog"] for d in data), n_att=sum(1 for j in JOBS if j["etat"] in ("attente", "envoi")))
 
 @app.route("/publier")
@@ -1059,7 +1080,8 @@ def reglages():
                        "oblig": sp(f["oblig"]) or OBLIG_TAGS, "pool": sp(f["pool"]),
                        "heures": [int(x) for x in sp(f["heures"]) if x.isdigit() and int(x) < 24] or DEFAUT_HEURES,
                        "max_jour": max(1, min(10, (int(f["max_jour"]) if f.get("max_jour", "").strip().isdigit() else 4))), "fond": f.get("fond", "").strip(),
-                       "apprentissage": bool(f.get("apprentissage"))}
+                       "apprentissage": bool(f.get("apprentissage")),
+                       "alerte_vues": int(f["alerte_vues"]) if f.get("alerte_vues", "").strip().isdigit() else 1000}
         sauver(cid, d)
         return redirect("/reglages?msg=Réglages enregistrés.")
     return vue("reglages", c=config(cid), notif=moyens(), stockage=etat_stockage())
@@ -1143,7 +1165,8 @@ table{width:100%;border-collapse:separate;border-spacing:0;border-radius:20px;ov
 {% if msg %}<div class="msg">{{msg}}</div>{% endif %}
 {% if not cid %}<h1>Connecte ta chaîne YouTube</h1><a class="btn" href="/connect">Connecter ma chaîne</a>
 {% elif view=='home' %}
-{% if not data %}<div class="msg">Données YouTube indisponibles pour l’instant. Réessaie dans un instant.</div>{% endif %}
+{% for e in erreurs %}<div class="msg err">⚠️ <b>{{e.nom}}</b> : {{e.txt}}{% if e.reco %} <a href="/connect">Reconnecter la chaîne</a>{% endif %}</div>{% endfor %}
+{% if not data and not erreurs %}<div class="msg">Données YouTube indisponibles pour l’instant. Réessaie dans un instant.</div>{% endif %}
 <div class="hero"><div class="g clk"><svg id="ck" viewBox="0 0 200 200"><circle cx="100" cy="100" r="97" fill="rgba(0,0,0,.28)" stroke="rgba(255,255,255,.22)" stroke-width="2"/>
 <line id="hh" x1="100" y1="100" x2="100" y2="58" stroke="#fff" stroke-width="5" stroke-linecap="round"/><line id="mm" x1="100" y1="100" x2="100" y2="32" stroke="#fff" stroke-width="3.5" stroke-linecap="round"/>
 <line id="ss" x1="100" y1="112" x2="100" y2="22" stroke="#ff5a36" stroke-width="1.8" stroke-linecap="round"/><circle cx="100" cy="100" r="4.5" fill="#ff5a36"/></svg></div>
@@ -1284,6 +1307,7 @@ load();setInterval(load,3000);
 <label>Hashtags candidats en plus (le site choisit les meilleurs parmi eux, 15 par vidéo)</label><textarea name="pool">{{c.pool|join(', ')}}</textarea>
 <label>Heures de pointe (YouTube Studio, onglet Audience). Publication 5 min avant.</label><input name="heures" value="{{c.heures|join(', ')}}">
 <label>Vidéos maximum par jour</label><input name="max_jour" type="number" min="1" max="10" value="{{c.max_jour}}">
+<label>Alerte « ça décolle » : vues en 24 h pour être prévenu (0 = pas d'alerte)</label><input name="alerte_vues" type="number" min="0" value="{{c.alerte_vues}}">
 <label>Image de fond (lien, facultatif)</label><input name="fond" value="{{c.fond}}" placeholder="https://…">
 <label class="chk"><input type="checkbox" name="apprentissage" {{'checked' if c.apprentissage}}> Apprendre de mes résultats</label>
 <button>Enregistrer</button></form>
