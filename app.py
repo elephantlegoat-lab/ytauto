@@ -10,9 +10,12 @@ from googleapiclient.http import MediaFileUpload
 
 app = Flask(__name__)
 app.secret_key = os.environ["SECRET_KEY"]
+LOGIN_FAILS = {}
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024**3
 BASE = os.environ["BASE_URL"].rstrip("/")
 PASSWORD = os.environ["APP_PASSWORD"]
+app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=BASE.startswith("https"),
+                  PERMANENT_SESSION_LIFETIME=timedelta(days=30))
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Paris"))
 DATA = os.environ.get("DATA_DIR", "data")
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
@@ -238,36 +241,59 @@ def choisir(hist, cfg, occ=None):
     quand = prochain_creneau(occupation(hist) if occ is None else occ, ranked, int(cfg["max_jour"]))
     return titre, oblig + pris_tags, quand.astimezone(timezone.utc), appr
 
-def gemini(prompt):
-    """Retourne (texte, erreur). Essaie plusieurs modèles si le premier ne répond pas."""
+_GM = {"t": 0, "noms": []}
+
+def _modeles_gemini(key):
+    """Liste les modèles Gemini réellement disponibles pour ta clé (mise en mémoire 1 h)."""
+    if _GM["noms"] and time.time() - _GM["t"] < 3600: return _GM["noms"]
+    try:
+        rq = urllib.request.Request("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                                    headers={"x-goog-api-key": key})
+        L = json.load(urllib.request.urlopen(rq, timeout=15)).get("models", [])
+        ok = [m["name"].split("/")[-1] for m in L if "generateContent" in m.get("supportedGenerationMethods", [])]
+        bons = [n for n in ok if "flash" in n and not any(x in n for x in ("image", "tts", "live", "audio", "embed", "robotics", "computer"))]
+        _GM.update(t=time.time(), noms=sorted(sorted(bons, reverse=True), key=lambda n: "preview" in n or "exp" in n))
+    except Exception: pass
+    return _GM["noms"]
+
+def _appel(m, prompt, key, timeout):
+    gc = {"maxOutputTokens": 800}
+    if "2.5-flash" in m and "lite" not in m: gc["thinkingConfig"] = {"thinkingBudget": 0}  # réponse rapide, sans réflexion
+    rq = urllib.request.Request(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+        data=json.dumps({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gc}).encode(),
+        headers={"Content-Type": "application/json", "x-goog-api-key": key})
+    r = json.load(urllib.request.urlopen(rq, timeout=timeout))
+    return r["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+def gemini(prompt, max_essais=4):
+    """Retourne (texte, erreur). Essaie ton modèle, puis ceux que ta clé permet vraiment d'utiliser."""
     key = os.environ.get("GEMINI_API_KEY")
     if not key: return None, "clé GEMINI_API_KEY absente sur Render"
-    noms = [os.environ.get("GEMINI_MODEL"), "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
-    err = ""
-    for m in dict.fromkeys(x for x in noms if x):
-        req = urllib.request.Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
-            data=json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode(),
-            headers={"Content-Type": "application/json", "x-goog-api-key": key})
-        try:
-            r = json.load(urllib.request.urlopen(req, timeout=60))
-            return r["candidates"][0]["content"]["parts"][0]["text"].strip(), ""
-        except Exception as e:
-            err = f"{m} : {e}"
-    return None, err
+    errs, vus = [], set()
+    for phase in (0, 1):
+        noms = [os.environ.get("GEMINI_MODEL"), "gemini-2.5-flash"] if phase == 0 else _modeles_gemini(key)[:3]
+        for m in noms:
+            if not m or m in vus or len(vus) >= max_essais: continue
+            vus.add(m)
+            try: return _appel(m, prompt, key, 20), ""
+            except Exception as e: errs.append(f"{m} : {str(e)[:70]}")
+    return None, " · ".join(errs) or "aucun modèle disponible"
 
 def variante_locale(bons, out, deja):
-    """Secours sans IA : mélange le début d'un de tes bons titres avec la fin d'un autre."""
-    emo = ["😴", "🎧", "✨", "💤", "🔊", "🌙"]
+    """Secours sans IA : mélange le début d'un de tes bons titres avec la fin d'un autre (jamais deux fois le même texte)."""
+    crochets = ["à écouter au casque 🎧", "pour t’endormir 😴", "ultra relaxant ✨", "volume à fond 🔊", "(attention, frissons)"]
     sep = r"[:?!|]|\s[-–]\s"
-    pris = {o.lower() for o in out}
-    for _ in range(30):
-        a, b = random.choice(bons), random.choice(bons)
+    nk = lambda t: re.sub(r"[^\w\s]", "", t.lower()).strip()
+    pris = {nk(o) for o in out} | {nk(d) for d in deja}
+    for _ in range(60):
+        a, b = random.sample(bons, 2) if len(bons) > 1 else (bons[0], bons[0])
         tete = re.split(sep, a)[0].strip()
+        court = len(tete) < 14
+        if court: tete = a.strip()  # début trop court (ex : « ASMR ») : on garde le titre entier
         fin = (re.split(sep, b)[1:] or [""])[0].strip()
-        t = (f"{tete} : {fin}" if fin and fin != tete else f"{tete} {random.choice(emo)}")[:90]
-        if t.lower() not in deja and t.lower() not in pris: return t
-    return f"{bons[0][:80]} {random.choice(emo)}"
+        t = (f"{tete} : {fin}" if not court and fin and nk(fin) != nk(tete) and random.random() < .6 else f"{tete} {random.choice(crochets)}")[:90]
+        if nk(t) not in pris: return t
+    return f"{bons[0][:60]} {random.randint(2, 99)} 🎧"
 
 def generer_titres(hist, cfg, n):
     """n titres DIFFÉRENTS, inspirés de tes meilleures vidéos. Retourne (titres, erreur_ia)."""
@@ -285,7 +311,7 @@ def generer_titres(hist, cfg, n):
            "sans en copier aucun. Max 70 caractères chacun. Un titre par ligne, sans numéro, sans guillemets, rien d'autre.")
     txt, err = gemini(p)
     for l in (txt or "").splitlines():
-        l = re.sub(r"^[\s\-\d.)*•]+", "", l).strip().strip('"')
+        l = re.sub(r"[<>]", "", re.sub(r"<[^>]*>", "", re.sub(r"^[\s\-\d.)*•]+", "", l))).strip().strip('"“”*')
         if l and l.lower() not in deja and l.lower() not in {o.lower() for o in out}: out.append(l[:100])
     for t in cfg["titres"]:
         if len(out) >= n: break
@@ -303,7 +329,7 @@ def traiter(cid, jobs):
         hist = historique(yt); occ = occupation(hist)
         titres, err_ia = generer_titres(hist, cfg, len(jobs))
         for j, titre in zip(jobs, titres):
-            j.update(etat="envoi", titre=j.get("force") or titre, ia=err_ia)
+            j.update(etat="envoi", titre=re.sub(r"[<>]", "", j.get("force") or titre), ia=err_ia)
             try:
                 _, tags, when, appr = choisir(hist, cfg, occ)
                 body = {"snippet": {"title": j["titre"][:100], "description": " ".join(tags), "categoryId": "22"},
@@ -489,6 +515,8 @@ def cache(cle, ttl, fn):
 @app.after_request
 def pas_de_cache(r):
     if r.mimetype == "text/html": r.headers["Cache-Control"] = "no-store"
+    r.headers.setdefault("X-Content-Type-Options", "nosniff"); r.headers.setdefault("X-Frame-Options", "DENY")
+    r.headers.setdefault("Referrer-Policy", "same-origin")
     return r
 
 def recent(cid, yt):
@@ -722,10 +750,15 @@ def vue(nom, **kw):
 @app.route("/login", methods=["GET", "POST"])
 def login():
     err = ""
-    if request.method == "POST":
-        if request.form.get("pw") == PASSWORD:
-            session["ok"] = True
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+    n, t = LOGIN_FAILS.get(ip, (0, 0))
+    if n >= 5 and time.time() - t < 600:
+        err = "Trop d’essais. Réessaie dans 10 minutes."
+    elif request.method == "POST":
+        if hmac.compare_digest(request.form.get("pw", "").encode(), PASSWORD.encode()):
+            LOGIN_FAILS.pop(ip, None); session.permanent = True; session["ok"] = True
             return redirect("/")
+        LOGIN_FAILS[ip] = ((n + 1) if time.time() - t < 600 else 1, time.time())
         err = "Mot de passe incorrect."
     return render_template_string(PAGE, view="login", err=err, chaines=[], cid=None, msg=None)
 
@@ -733,7 +766,8 @@ def login():
 @authed
 def canal(cid):
     session["cid"] = cid
-    return redirect(request.args.get("retour", "/"))
+    r = request.args.get("retour", "/")
+    return redirect(r if r.startswith("/") and not r.startswith("//") else "/")
 
 @app.route("/")
 @authed
@@ -771,9 +805,12 @@ def connect():
 def callback():
     f = flow()
     f.code_verifier = session.get("cv")
-    f.fetch_token(authorization_response=BASE + request.full_path)
+    try: f.fetch_token(authorization_response=BASE + request.full_path)
+    except Exception as e: return redirect("/?msg=" + urllib.parse.quote("Connexion impossible : " + str(e)[:120]))
     yt = build("youtube", "v3", credentials=f.credentials)
-    ch = yt.channels().list(part="snippet", mine=True).execute()["items"][0]
+    items = yt.channels().list(part="snippet", mine=True).execute().get("items", [])
+    if not items: return redirect("/?msg=" + urllib.parse.quote("Aucune chaîne YouTube trouvée sur ce compte Google."))
+    ch = items[0]
     d = charger(ch["id"]) or {}
     d.update(nom=ch["snippet"]["title"], token=f.credentials.to_json())
     sauver(ch["id"], d)
@@ -787,7 +824,7 @@ def upload():
     if not cid: return redirect("/connect")
     jobs = []
     for f in request.files.getlist("video"):
-        if not f.filename: continue
+        if not f.filename or not (f.mimetype.startswith("video/") or f.filename.lower().endswith((".mp4", ".mov", ".m4v", ".webm", ".mkv"))): continue
         p = os.path.join(tempfile.gettempdir(), uuid.uuid4().hex + ".mp4")
         f.save(p)
         if os.path.getsize(p) == 0:
@@ -820,7 +857,8 @@ def file_json():
 def diagnostic():
     cid = active()
     if not cid: return redirect("/")
-    seuil = int(request.args.get("seuil", 1500))
+    try: seuil = max(1, min(int(request.args.get("seuil", 1500)), 10**6))
+    except ValueError: seuil = 1500
     d = perr = pred = perr2 = None
     try:
         yt = yt_for(cid); hist = historique(yt)
@@ -839,7 +877,7 @@ def diagnostic():
              + "\n".join(L(r) for r in d["top"]) + "\nLES MOINS BONNES :\n" + "\n".join(L(r) for r in d["bas"][:15])
              + "\n\nAnalyse en profondeur pourquoi les moins bonnes n'ont pas percé et donne 8 actions concrètes et précises "
                "(titre, hashtags, durée, accroche des premières secondes, son, miniature, heure, format). Réponds en français, texte simple, sans markdown.")
-        ia, err = gemini(p)
+        ia, err = gemini(p, 2)
     return vue("diag", d=d, seuil=seuil, ia=ia, err=err, perr=perr, pred=pred, perr2=perr2)
 
 @app.route("/calendrier")
@@ -847,8 +885,11 @@ def diagnostic():
 def cal():
     cid = active()
     if not cid: return redirect("/")
-    m = request.args.get("m") or datetime.now(TZ).strftime("%Y-%m")
-    a, mo = map(int, m.split("-"))
+    try:
+        a, mo = map(int, (request.args.get("m") or datetime.now(TZ).strftime("%Y-%m")).split("-")); datetime(a, mo, 1)
+    except Exception:
+        a, mo = datetime.now(TZ).year, datetime.now(TZ).month
+    m = f"{a}-{mo:02d}"
     jours = {}
     for v in historique(yt_for(cid)):
         jours.setdefault(v["pub"].astimezone(TZ).date(), []).append(v)
@@ -874,7 +915,7 @@ def biblio():
 def stats():
     cid = active()
     if not cid: return redirect("/")
-    j = int(request.args.get("j", 28)); j = j if j in (7, 28, 90) else 28
+    j = request.args.get("j", "28"); j = int(j) if j in ("7", "28", "90") else 28
     yt = yt_for(cid); v = mesurees(historique(yt))
     top = lambda cles: sorted(((k, n, round(m, 2)) for k, (n, m) in stats_par(v, cles).items()),
                               key=lambda x: -x[2])[:6]
@@ -888,6 +929,19 @@ def stats():
     return vue("stats", j=j, an=an, err=err, mon=mon, fr=fr, maj=datetime.now(TZ).strftime("%H:%M"), nm=len(v), mini=MIN_APPRENTISSAGE,
                heures=top(lambda x: [f"{heure_de(x)}h"]), titres=top(lambda x: [x["titre"]]),
                tags=top(hashtags_de))
+
+@app.route("/ia/test", methods=["POST"])
+@authed
+def ia_test():
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key: return redirect("/reglages?msg=" + urllib.parse.quote("GEMINI_API_KEY absente sur Render."))
+    res = []
+    for m in dict.fromkeys([x for x in (os.environ.get("GEMINI_MODEL"), "gemini-2.5-flash") if x] + _modeles_gemini(key)[:3]):
+        t0 = time.time()
+        try:
+            _appel(m, "Réponds seulement : ok", key, 15); res.append(f"{m} : OK en {time.time() - t0:.1f} s")
+        except Exception as e: res.append(f"{m} : échec ({str(e)[:60]})")
+    return redirect("/reglages?msg=" + urllib.parse.quote(" · ".join(res)))
 
 @app.route("/notif/test", methods=["POST"])
 @authed
@@ -964,7 +1018,7 @@ def reglages():
         d["config"] = {"titres": [x.strip() for x in f["titres"].splitlines() if x.strip()],
                        "oblig": sp(f["oblig"]) or OBLIG_TAGS, "pool": sp(f["pool"]),
                        "heures": [int(x) for x in sp(f["heures"]) if x.isdigit() and int(x) < 24] or DEFAUT_HEURES,
-                       "max_jour": max(1, min(10, int(f.get("max_jour") or 4))), "fond": f.get("fond", "").strip(),
+                       "max_jour": max(1, min(10, (int(f["max_jour"]) if f.get("max_jour", "").strip().isdigit() else 4))), "fond": f.get("fond", "").strip(),
                        "apprentissage": bool(f.get("apprentissage"))}
         sauver(cid, d)
         return redirect("/reglages?msg=Réglages enregistrés.")
@@ -1005,7 +1059,7 @@ button:active,.btn:active,.tile:active,.dock a:active,.pill:active{transform:sca
 .dock a.on{background:rgba(255,255,255,.28);box-shadow:inset 0 1px 0 rgba(255,255,255,.4)}.dock svg,.tile svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.dock span{font-size:.58rem;color:var(--mut)}.dock a.on span{color:var(--ink)}
 .hero{display:grid;grid-template-columns:220px 1fr;gap:14px}.clk{padding:14px;display:flex;align-items:center;justify-content:center}.clk svg{width:100%;max-width:190px}
 .big{display:grid;grid-template-columns:1.3fr 1fr;gap:18px;padding:20px 24px}.tm{display:flex;align-items:flex-start;line-height:1}.tm b{font-size:5.2rem;font-weight:800;letter-spacing:-.04em;font-variant-numeric:tabular-nums}.tm sup{font-size:1.5rem;color:var(--acc);margin:.5em 0 0 6px;font-weight:700}
-.dt{font-weight:700;font-size:1.05rem;margin-top:.3em}.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.chips span{font-size:.8rem;padding:6px 12px;border-radius:99px;background:rgba(255,255,255,.12)}
+.stk2{margin-top:12px;font-size:.98rem;color:#fff;background:rgba(255,255,255,.1);padding:8px 14px;border-radius:14px;display:inline-block;margin-right:6px}.dt{font-weight:700;font-size:1.05rem;margin-top:.3em}.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.chips span{font-size:.8rem;padding:6px 12px;border-radius:99px;background:rgba(255,255,255,.12)}
 .ap{border-left:1px solid var(--line);padding-left:18px}.ai{display:flex;gap:10px;padding:7px 0;font-size:.88rem;line-height:1.3}.ai b{color:#fff;font-variant-numeric:tabular-nums;border-left:3px solid var(--acc);padding-left:8px;min-width:62px}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px;margin:18px 0}.tile{display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--ink);font-size:.82rem;font-weight:600;transition:transform .18s}
 .tile span{width:68px;height:68px;border-radius:22px;display:flex;align-items:center;justify-content:center}.tile svg{width:28px;height:28px}
@@ -1054,6 +1108,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;border-radius:20px;ov
 <line id="hh" x1="100" y1="100" x2="100" y2="58" stroke="#fff" stroke-width="5" stroke-linecap="round"/><line id="mm" x1="100" y1="100" x2="100" y2="32" stroke="#fff" stroke-width="3.5" stroke-linecap="round"/>
 <line id="ss" x1="100" y1="112" x2="100" y2="22" stroke="#ff5a36" stroke-width="1.8" stroke-linecap="round"/><circle cx="100" cy="100" r="4.5" fill="#ff5a36"/></svg></div>
 <div class="g big"><div><span id="gr" class="mut"></span><div class="tm"><b id="hm">--:--</b><sup id="sc"></sup></div><div class="dt" id="dt"></div>
+{% for d in data %}<div class="stk2"><b>{{d.nom}}</b> · {{d.stock.videos}} vidéo(s) en stock{% if d.stock.videos %} · de quoi tenir <b>{{d.stock.jours}} jour(s)</b> (jusqu’au {{d.stock.dernier.strftime('%d/%m')}}){% else %} · plus rien de programmé !{% endif %}</div>{% endfor %}
 <div class="chips"><span>{{n_prog}} programmée(s)</span><span>{{n_att}} en attente</span><span>{{chaines|length}} chaîne(s)</span></div></div>
 <div class="ap"><h3>AU PROGRAMME</h3>{% for f,nom in prog %}<div class="ai"><b>{{f.quand.strftime('%H:%M')}}</b><div>{{f.titre[:36]}}<br><span class="mut">{{nom}} · {{f.jour}}</span></div></div>{% else %}<p>Rien de programmé pour l’instant.</p>{% endfor %}</div></div></div>
 <div class="tiles">{% for u,l,i in [('/publier','Publier','upload'),('/stats','Analytique','chart'),('/calendrier','Calendrier','cal'),('/bibliotheque','Bibliothèque','grid'),('/diagnostic','Diagnostic','search'),('/reglages','Réglages','sliders')] %}
@@ -1195,6 +1250,7 @@ load();setInterval(load,3000);
 <h2>Notifications</h2><div class="g box"><p>Moyens actifs : {{notif|join(', ') if notif else 'aucun (voir les variables sur Render)'}}.</p>
 <p style="font-size:.85rem">Alerte quand le stock est bas, et bilan de la semaine chaque vendredi dès 18h.</p>
 <form method="post" action="/notif/test"><button type="submit">Envoyer une notification de test</button></form>
+<form method="post" action="/ia/test"><button type="submit">Tester l’IA (Gemini)</button></form>
 <form method="post" action="/notif/bilan"><button type="submit">Envoyer le bilan de la semaine maintenant</button></form></div>
 {% endif %}{% endif %}
 </main>{% if view!='login' %}<script>
