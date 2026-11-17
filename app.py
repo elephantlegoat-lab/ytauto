@@ -322,6 +322,22 @@ def generer_titres(hist, cfg, n):
 
 JOBS = []
 
+def signature(p):
+    """Empreinte rapide d'un fichier : taille + début + fin (suffit à repérer un même fichier)."""
+    import hashlib
+    n = os.path.getsize(p); h = hashlib.sha256(str(n).encode())
+    with open(p, "rb") as f:
+        h.update(f.read(1024 * 1024))
+        if n > 2 * 1024 * 1024: f.seek(-1024 * 1024, 2); h.update(f.read())
+    return h.hexdigest()
+
+def deja_envoyes(cid): return kv_get("sig:" + cid) or []
+
+def noter_envoi(cid, sig, nom):
+    L = [x for x in deja_envoyes(cid) if x.get("sig") != sig]
+    L.append(dict(sig=sig, nom=nom, le=datetime.now(TZ).strftime("%d/%m")))
+    kv_set("sig:" + cid, L[-500:])
+
 def traiter(cid, jobs):
     """Tourne en arrière-plan : envoie chaque vidéo, vérifie qu'YouTube l'a bien reçue."""
     try:
@@ -346,6 +362,7 @@ def traiter(cid, jobs):
                 stt = v[0]["status"]
                 warn = "" if stt.get("publishAt") else \
                     "YouTube n'a pas gardé la programmation (projet Google non validé) : la vidéo reste privée."
+                if j.get("sig"): noter_envoi(cid, j["sig"], j["nom"])
                 j.update(etat="ok", pct=100, vid=resp["id"], warn=warn,
                          quand=f"{when.astimezone(TZ):%d/%m à %Hh%M}")
                 hist.insert(0, dict(id=resp["id"], titre=j["titre"], desc=" ".join(tags), pub=when, vues=0, likes=0,
@@ -822,15 +839,23 @@ def callback():
 def upload():
     cid = active()
     if not cid: return redirect("/connect")
-    jobs = []
+    jobs, doubles = [], []
+    vus = {x["sig"]: x for x in deja_envoyes(cid)}
+    en_cours = {j.get("sig") for j in JOBS if j.get("etat") in ("attente", "envoi")}
     for f in request.files.getlist("video"):
         if not f.filename or not (f.mimetype.startswith("video/") or f.filename.lower().endswith((".mp4", ".mov", ".m4v", ".webm", ".mkv"))): continue
         p = os.path.join(tempfile.gettempdir(), uuid.uuid4().hex + ".mp4")
         f.save(p)
         if os.path.getsize(p) == 0:
             os.unlink(p); continue
-        jobs.append(dict(nom=f.filename, path=p, etat="attente", pct=0, titre="", msg="", warn="", vid="", quand="", ia=""))
-    if not jobs: return redirect("/?msg=Aucune vidéo reçue : réessaie de choisir tes fichiers.")
+        sig = signature(p)
+        if (sig in vus or sig in en_cours) and request.form.get("doublon") != "1":
+            doubles.append(f.filename); os.unlink(p); continue
+        en_cours.add(sig)
+        jobs.append(dict(sig=sig, nom=f.filename, path=p, etat="attente", pct=0, titre="", msg="", warn="", vid="", quand="", ia=""))
+    if not jobs:
+        if doubles: return redirect("/?msg=" + urllib.parse.quote("Déjà envoyée, ignorée : " + ", ".join(doubles)[:150]))
+        return redirect("/?msg=Aucune vidéo reçue : réessaie de choisir tes fichiers.")
     if len(jobs) == 1 and request.form.get("title", "").strip(): jobs[0]["force"] = request.form["title"].strip()
     JOBS[:] = JOBS[-30:] + jobs
     threading.Thread(target=traiter, args=(cid, jobs), daemon=True).start()
