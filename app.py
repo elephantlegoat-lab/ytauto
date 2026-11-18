@@ -158,7 +158,24 @@ def historique(yt):
                         img=s.get("thumbnails", {}).get("medium", {}).get("url", "")))
     return sorted(out, key=lambda v: v["pub"], reverse=True)
 
-def score(v): return math.log1p(v["vues"]) + 0.5 * math.log1p(v["likes"])
+V7 = None
+V7_PAUSE = {}
+
+def v7_charge():
+    global V7
+    if V7 is None:
+        try: V7 = kv_get("v7") or {}
+        except Exception: V7 = {}
+    return V7
+
+def vues_sem1(v):
+    """Vues de la 1re semaine quand on les connaît (comparable entre vidéos, vieilles ou récentes), sinon vues totales."""
+    x = v7_charge().get(v["id"])
+    return v["vues"] if x is None else x
+
+def score(v):
+    s = vues_sem1(v); l = v["likes"] * min(1, s / max(v["vues"], 1))
+    return math.log1p(s) + 0.5 * math.log1p(l)
 
 def mesurees(hist):
     lim = datetime.now(timezone.utc) - timedelta(hours=48)
@@ -322,7 +339,22 @@ def generer_titres(hist, cfg, n):
         out.append(variante_locale(bons or ["ASMR relaxant pour dormir"], out, deja))
     return out[:n], err
 
-JOBS = []
+def _charger_jobs():
+    """Liste d'envoi gardée dans Redis : après un redémarrage, on voit ce qui a été interrompu au lieu de tout perdre."""
+    try: L = kv_get("jobs") or []
+    except Exception: L = []
+    for j in L:
+        if j.get("etat") in ("attente", "envoi"):
+            j.update(etat="erreur", msg=("Interrompu : le site a redémarré. Cette vidéo repart toute seule depuis ton dossier Drive."
+                                         if j.get("drive_id") else
+                                         "Interrompu : le site a redémarré pendant l'envoi. Renvoie cette vidéo (ou mets-la dans ton dossier Drive)."))
+    return L
+
+JOBS = _charger_jobs()
+
+def sauver_jobs():
+    try: kv_set("jobs", [{k: v for k, v in j.items() if k != "path"} for j in JOBS[-30:]])
+    except Exception: pass
 DRIVE_INFO, DRIVE_PAUSE = {}, {}
 
 def prochain_9h():
@@ -356,7 +388,14 @@ def noter_envoi(cid, sig, nom):
     L.append(dict(sig=sig, nom=nom, le=datetime.now(TZ).strftime("%d/%m")))
     kv_set("sig:" + cid, L[-500:])
 
+_TRAITER = threading.Lock()
+
 def traiter(cid, jobs):
+    try:
+        with _TRAITER: _traiter(cid, jobs)
+    finally: sauver_jobs()
+
+def _traiter(cid, jobs):
     """Tourne en arrière-plan : envoie chaque vidéo, vérifie qu'YouTube l'a bien reçue."""
     try:
         yt, cfg = yt_for(cid), config(cid)
@@ -375,16 +414,17 @@ def traiter(cid, jobs):
                 while resp is None:
                     st, resp = req.next_chunk()
                     if st: j["pct"] = int(st.progress() * 100)
-                v = yt.videos().list(part="status", id=resp["id"]).execute().get("items", [])
                 flow_marquer(cid, [resp["id"]])
+                if j.get("sig"): noter_envoi(cid, j["sig"], j["nom"])
+                if j.get("drive_id"): drive_marquer(cid, j["drive_id"])  # déjà sur YouTube : on ne la renverra jamais
+                v = yt.videos().list(part="status", id=resp["id"]).execute().get("items", [])
                 if not v: raise Exception("YouTube ne retrouve pas la vidéo après l'envoi.")
                 stt = v[0]["status"]
                 warn = "" if stt.get("publishAt") else \
                     "YouTube n'a pas gardé la programmation (projet Google non validé) : la vidéo reste privée."
-                if j.get("sig"): noter_envoi(cid, j["sig"], j["nom"])
-                if j.get("drive_id"): drive_marquer(cid, j["drive_id"])
                 j.update(etat="ok", pct=100, vid=resp["id"], warn=warn,
                          quand=f"{when.astimezone(TZ):%d/%m à %Hh%M}")
+                sauver_jobs()
                 hist.insert(0, dict(id=resp["id"], titre=j["titre"], desc=" ".join(tags), pub=when, vues=0, likes=0,
                                     duree=0, statut="private", img=""))
             except Exception as e:
@@ -400,6 +440,7 @@ def traiter(cid, jobs):
     except Exception as e:
         for j in jobs:
             if j["etat"] == "attente": j.update(etat="erreur", msg=str(e)[:300])
+        if any(j.get("drive_id") for j in jobs): DRIVE_INFO[cid] = "Problème : " + erreur_claire(e)[0]
     finally:
         for j in jobs:
             if os.path.exists(j["path"]): os.unlink(j["path"])
@@ -445,7 +486,7 @@ def _drive_traiter(cid, nom, fichiers):
                 drive_essai(cid, f["id"])
                 if os.path.exists(p): os.unlink(p)
         if jobs:
-            JOBS[:] = JOBS[-30:] + jobs
+            JOBS[:] = JOBS[-30:] + jobs; sauver_jobs()
             traiter(cid, jobs)
             ok = [j for j in jobs if j["etat"] == "ok"]; ko = [j for j in jobs if j["etat"] != "ok"]
             if moyens():
@@ -470,6 +511,11 @@ def flow_auto(cid, nom):
     """Une vidéo envoyée en privé depuis Flow (moins de 24 h, pas programmée) reçoit un titre IA, 15 hashtags et un créneau."""
     cfg = config(cid)
     if not cfg.get("flow_auto"): return []
+    if not _TRAITER.acquire(blocking=False): return []  # un envoi est en cours : on repasse au prochain tour
+    try: return _flow_auto(cid, nom, cfg)
+    finally: _TRAITER.release()
+
+def _flow_auto(cid, nom, cfg):
     yt = yt_for(cid); hist = historique(yt); d = _flow_ids(cid); now = datetime.now(timezone.utc)
     age = lambda v: (now - v["pub"]).total_seconds() / 3600
     if not d["base"]:  # 1re vérification : tout ce qui existe déjà est mis de côté, on ne touche qu'aux NOUVELLES vidéos
@@ -568,7 +614,7 @@ def analyser(hist, ret, seuil):
     for v in hist:
         age = (now - v["pub"]).total_seconds() / 86400
         if v["statut"] != "public" or age < 2: continue
-        rows.append(dict(v, vpj=v["vues"] / min(age, 7), age=age, nb_tags=len(hashtags_de(v)), long_t=len(v["titre"]),
+        rows.append(dict(v, vpj=vues_sem1(v) / min(age, 7), age=age, nb_tags=len(hashtags_de(v)), long_t=len(v["titre"]),
                          q="?" in v["titre"], asmr="asmr" in v["titre"].lower(),
                          jlike=v["likes"] / max(v["vues"], 1) * 100, ret=ret.get(v["id"], {}).get("ret"),
                          h=heure_de(v)))
@@ -678,7 +724,9 @@ def chauffer():
     if not _CHAUF.acquire(blocking=False): return
     try:
         for cid, _ in liste():
-            try: CACHE[("h", cid)] = (time.time(), donnees_chaine(cid))
+            try: d = donnees_chaine(cid); CACHE[("h", cid)] = (time.time(), d)
+            except Exception: continue
+            try: suivi(cid, d)
             except Exception: pass
     finally: _CHAUF.release()
 
@@ -899,7 +947,7 @@ def prevision(cid, yt, hist):
             r = 0.5 * r7 + 0.5 * min(max(rc["est"] / rc["jours"], 0.5 * r7), 2 * r7)
     except Exception: pass
     now = datetime.now(timezone.utc)
-    vp = lambda x: x["vues"] / min((now - x["pub"]).total_seconds() / 86400, 7)
+    vp = lambda x: vues_sem1(x) / min((now - x["pub"]).total_seconds() / 86400, 7)
     pub = [x for x in hist if x["statut"] == "public" and (now - x["pub"]).days >= 2]
     sh = [x for x in pub if 0 < x["duree"] <= 180]
     if len(sh) < 6: sh = pub
@@ -926,7 +974,8 @@ def prevision(cid, yt, hist):
         preds.append((lab, int(c), int(max(0, c * (1 - rel))), int(c * (1 + rel))))
     lifts = sorted(tl.items(), key=lambda x: -x[1])
     net7 = sum(r_[2] - r_[3] for r_ in rows[-7:]); par_jour = net7 / 7
-    subs = int(yt.channels().list(part="statistics", mine=True).execute()["items"][0]["statistics"].get("subscriberCount", 0))
+    stt = yt.channels().list(part="statistics", mine=True).execute()["items"][0]["statistics"]
+    subs = int(stt.get("subscriberCount", 0)); vues_tot = int(stt.get("viewCount", 0))
     obj = []
     for cible in (20000, 50000, 100000):
         if subs >= cible: obj.append((cible, "déjà atteint", "déjà atteint"))
@@ -936,7 +985,112 @@ def prevision(cid, yt, hist):
             obj.append((cible, _quand(j), _quand(j / 2)))
     return dict(preds=preds, nb=len(sh), r=int(r), tend=f"{(g - 1) * 100:+.1f} %", frel=round(f_rel, 2),
                 bons=[h for h, l in lifts if l > 1.05][:3], mauvais=[h for h, l in lifts[::-1] if l < 0.95][:3],
-                subs=subs, par_jour=round(par_jour, 1), objectifs=obj)
+                subs=subs, vues_tot=vues_tot, par_jour=round(par_jour, 1), objectifs=obj)
+
+def v7_remplir(cid, hist, max_n=8):
+    """Mesure une fois pour toutes les vues des 7 premiers jours des vidéos de plus de 10 jours (quelques-unes à chaque passage)."""
+    if time.time() < V7_PAUSE.get(cid, 0): return 0
+    V = v7_charge(); now = datetime.now(timezone.utc)
+    todo = [v for v in hist if v["statut"] == "public" and (now - v["pub"]).days >= 10 and v["id"] not in V][:max_n]
+    if not todo: return 0
+    ya = build("youtubeAnalytics", "v2", credentials=creds_for(cid)); n = 0
+    for v in todo:
+        d0 = v["pub"].astimezone(TZ).date()
+        try:
+            rows = ya.reports().query(ids="channel==MINE", startDate=str(d0), endDate=str(d0 + timedelta(days=6)),
+                                      metrics="views", filters=f"video=={v['id']}").execute().get("rows", [])
+        except Exception as e:
+            t = str(e).lower()
+            if any(x in t for x in ("quota", "ratelimit", "429", "forbidden", "insufficient", "403")): V7_PAUSE[cid] = time.time() + 6 * 3600
+            break
+        if rows: V[v["id"]] = int(rows[0][0]); n += 1
+        elif v["vues"] <= 50: V[v["id"]] = 0; n += 1   # vraiment peu de vues
+    if n: kv_set("v7", V)
+    return n
+
+def v7_couverture(hist):
+    V = v7_charge(); now = datetime.now(timezone.utc)
+    vieilles = [v for v in hist if v["statut"] == "public" and (now - v["pub"]).days >= 10]
+    return sum(1 for v in vieilles if v["id"] in V), len(vieilles)
+
+HORIZONS = {"24 heures": 1, "48 heures": 2, "1 semaine": 7, "1 mois": 30}
+
+def snap_noter(cid, vues, abos):
+    """Relevé des compteurs de la chaîne (environ toutes les heures) : sert à comparer les prévisions à la réalité."""
+    S = kv_get("snap:" + cid) or []; t = time.time()
+    if S and t - S[-1][0] < 3300: return
+    S.append([t, int(vues), int(abos)]); kv_set("snap:" + cid, [x for x in S if x[0] > t - 45 * 86400])
+
+def prev_noter(cid, p):
+    """Garde la prévision du jour (une par jour et par chaîne)."""
+    P = kv_get("pred:" + cid) or []; jour = datetime.now(TZ).date().isoformat()
+    if any(x["jour"] == jour for x in P): return
+    P.append(dict(jour=jour, ts=time.time(), vues_tot=p["vues_tot"], subs=p["subs"], par_jour=p["par_jour"],
+                  preds=[[lab, HORIZONS[lab], c, lo, hi] for lab, c, lo, hi in p["preds"] if lab in HORIZONS]))
+    kv_set("pred:" + cid, P[-60:])
+
+PREV_TENTE = {}
+
+def prev_du_jour(cid, hist):
+    if datetime.now(TZ).hour < 6: return
+    jour = datetime.now(TZ).date().isoformat()
+    if any(x["jour"] == jour for x in (kv_get("pred:" + cid) or [])): return
+    n, dj = PREV_TENTE.get(cid, (0, ""))
+    if dj == jour and n >= 2: return
+    PREV_TENTE[cid] = (n + 1 if dj == jour else 1, jour)
+    prev_noter(cid, cache(("prev", cid), 300, lambda: prevision(cid, yt_for(cid), hist)))
+
+def suivi(cid, d):
+    """Tâches de fond après chaque préparation de l'accueil."""
+    snap_noter(cid, d["vues"], d["abos"])
+    hist = CACHE.get(("hist", cid), (0, None))[1]
+    if hist:
+        try: v7_remplir(cid, hist)
+        except Exception: pass
+        try: prev_du_jour(cid, hist)
+        except Exception: pass
+
+def prev_evalue(cid):
+    """Compare ce que le site avait prévu à ce qui s'est vraiment passé."""
+    P = kv_get("pred:" + cid) or []; S = kv_get("snap:" + cid) or []
+    if not P:
+        return dict(lignes=[], dernieres=[], texte="Le site garde désormais chaque jour ce qu’il prévoit, puis le compare à la réalité. Première comparaison dans 24 heures (1 semaine : dans 7 jours).")
+    def val(t):
+        if len(S) < 2 or t < S[0][0] or t > S[-1][0]: return None
+        for a, b in zip(S, S[1:]):
+            if a[0] <= t <= b[0]:
+                k = (t - a[0]) / max(b[0] - a[0], 1); return a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k
+    rows = []
+    for p in P:
+        for lab, H, c, lo, hi in p["preds"]:
+            v = val(p["ts"] + H * 86400)
+            if v is None: continue
+            reel = v[0] - p["vues_tot"]
+            if reel > 0: rows.append(dict(jour=p["jour"], genre="Vues", lab=lab, prevu=c, reel=int(reel), lo=lo, hi=hi))
+        for lab, H in (("1 semaine", 7), ("1 mois", 30)):
+            v = val(p["ts"] + H * 86400)
+            if v is None: continue
+            prevu, reel = p["par_jour"] * H, v[1] - p["subs"]
+            if max(abs(prevu), abs(reel)) >= 5: rows.append(dict(jour=p["jour"], genre="Abonnés gagnés", lab=lab, prevu=round(prevu), reel=round(reel), lo=None, hi=None))
+    for r in rows: r["err"] = (r["prevu"] - r["reel"]) / max(abs(r["reel"]), 1)
+    lignes = []
+    for genre, labs in (("Vues", list(HORIZONS)), ("Abonnés gagnés", ["1 semaine", "1 mois"])):
+        for lab in labs:
+            g = [r for r in rows if r["genre"] == genre and r["lab"] == lab]
+            if not g: continue
+            err = statistics.median([abs(r["err"]) for r in g]) * 100; biais = statistics.median([r["err"] for r in g]) * 100
+            dans = [r for r in g if r["lo"] is not None]
+            lignes.append(dict(nom=f"{genre} · {lab}", n=len(g), err=round(err), biais=biais,
+                               biais_txt="pas de biais net" if abs(biais) < 5 else (f"surestime de {abs(biais):.0f} %" if biais > 0 else f"sous-estime de {abs(biais):.0f} %"),
+                               dans=f"{sum(1 for r in dans if r['lo'] <= r['reel'] <= r['hi']) * 100 // len(dans)} %" if dans else "—"))
+    dern = [dict(jour=r["jour"], nom=f"{r['genre']} · {r['lab']}", prevu=r["prevu"], reel=r["reel"],
+                 ecart=f"{r['err'] * 100:+.0f} %") for r in sorted(rows, key=lambda r: r["jour"], reverse=True)[:8]]
+    if not lignes:
+        texte = f"{len(P)} prévision(s) enregistrée(s). Pas encore assez de recul pour comparer : la première comparaison arrive 24 heures après la première prévision."
+    else:
+        l = next((x for x in lignes if x["nom"] == "Vues · 1 semaine"), lignes[0])
+        texte = f"Sur « {l['nom']} », le site se trompe d’environ {l['err']} % en général ({l['biais_txt']}), d’après {l['n']} comparaison(s)."
+    return dict(lignes=lignes, dernieres=dern, texte=texte)
 
 # ---------- accès ----------
 def authed(f):
@@ -1059,7 +1213,7 @@ def upload():
         if doubles: return redirect("/?msg=" + urllib.parse.quote("Déjà envoyée, ignorée : " + ", ".join(doubles)[:150]))
         return redirect("/?msg=Aucune vidéo reçue : réessaie de choisir tes fichiers.")
     if len(jobs) == 1 and request.form.get("title", "").strip(): jobs[0]["force"] = request.form["title"].strip()
-    JOBS[:] = JOBS[-30:] + jobs
+    JOBS[:] = JOBS[-30:] + jobs; sauver_jobs()
     threading.Thread(target=traiter, args=(cid, jobs), daemon=True).start()
     return redirect("/file")
 
@@ -1093,7 +1247,7 @@ def file():
 @app.route("/file/vider", methods=["POST"])
 @authed
 def file_vider():
-    JOBS[:] = [j for j in JOBS if j["etat"] in ("attente", "envoi")]
+    JOBS[:] = [j for j in JOBS if j["etat"] in ("attente", "envoi")]; sauver_jobs()
     return jsonify(ok=True)
 
 @app.route("/file.json")
@@ -1116,7 +1270,10 @@ def diagnostic():
     if hist is not None:
         try: d = analyser(hist, cache(("ret", cid), 300, lambda: retention(cid)), seuil)
         except Exception as e: perr = str(e)[:300]
-        try: pred = cache(("prev", cid), 300, lambda: prevision(cid, yt, hist))
+        try:
+            pred = cache(("prev", cid), 300, lambda: prevision(cid, yt, hist))
+            try: prev_noter(cid, pred)
+            except Exception: pass
         except Exception as e: perr2 = str(e)[:200]
     ia = err = None
     if d and request.args.get("ia"):
@@ -1127,7 +1284,10 @@ def diagnostic():
              + "\n\nAnalyse en profondeur pourquoi les moins bonnes n'ont pas percé et donne 8 actions concrètes et précises "
                "(titre, hashtags, durée, accroche des premières secondes, son, miniature, heure, format). Réponds en français, texte simple, sans markdown.")
         ia, err = gemini(p, 2)
-    return vue("diag", d=d, seuil=seuil, ia=ia, err=err, perr=perr, pred=pred, perr2=perr2)
+    try: fiab = prev_evalue(cid)
+    except Exception: fiab = None
+    v7n, v7t = v7_couverture(hist) if hist else (0, 0)
+    return vue("diag", d=d, seuil=seuil, ia=ia, err=err, perr=perr, pred=pred, perr2=perr2, fiab=fiab, v7n=v7n, v7t=v7t)
 
 @app.route("/calendrier")
 @authed
@@ -1475,11 +1635,15 @@ load();setInterval(load,3000);
 <p>Tu as environ <b>{{pred.subs}}</b> abonnés et tu en gagnes <b>{{pred.par_jour}}</b> par jour en moyenne sur les 7 derniers jours confirmés.</p>
 <table><tr><th>Objectif</th><th>À ce rythme</th><th>Si tu doubles le rythme</th></tr>{% for c,a,b in pred.objectifs %}<tr><td>{{c|k}} abonnés</td><td>{{a}}</td><td>{{b}}</td></tr>{% endfor %}</table>
 {% elif perr2 %}<div class="msg">Prévision indisponible : {{perr2}}</div>{% endif %}
+{% if fiab %}<h2>Mes prévisions sont-elles justes ?</h2>
+<p>{{fiab.texte}}</p>
+{% if fiab.lignes %}<table><tr><th></th><th>Comparées</th><th>Erreur habituelle</th><th>Tendance</th><th>Réel dans la fourchette</th></tr>{% for l in fiab.lignes %}<tr><td>{{l.nom}}</td><td>{{l.n}}</td><td>{{l.err}} %</td><td>{{l.biais_txt}}</td><td>{{l.dans}}</td></tr>{% endfor %}</table>
+<p class="mut" style="font-size:.85rem">Dernières comparaisons :</p>{% for r in fiab.dernieres %}<p class="mut" style="font-size:.85rem;margin:2px 0">{{r.jour}} · {{r.nom}} : prévu {{r.prevu|k}}, réel {{r.reel|k}} ({{r.ecart}})</p>{% endfor %}{% endif %}{% endif %}
 <h2>Pourquoi certaines vidéos n’ont pas percé</h2>
 <p>Vidéos publiées depuis plus de 2 jours, comparées à tes meilleures. Seuil : {{seuil}} vues par jour.</p>
 {% if perr %}<div class="msg">Impossible d’analyser pour l’instant : {{perr}}</div>
 {% elif not d %}<div class="msg">Pas assez de vidéos publiées depuis plus de 2 jours pour analyser (il en faut au moins 4).</div>{% else %}
-<p>Vues par jour = vues ÷ min(âge, 7 jours) : on regarde la première semaine, quand un Short fait l’essentiel de ses vues.</p>
+<p>Vues par jour = vues de la <b>première semaine</b> ÷ 7, pour comparer toutes les vidéos à égalité (une vieille vidéo n’est plus avantagée).{% if v7t %} Mesure faite pour {{v7n}} vidéo(s) sur {{v7t}} de plus de 10 jours ; les autres sont encore mesurées en arrière-plan.{% endif %}</p>
 {% if not d.ref_seuil %}<div class="msg">Moins de 3 vidéos dépassent {{seuil}} vues/jour : la comparaison se fait avec tes {{d.nb_ref}} meilleures vidéos, qui ne sont pas listées ci-dessous.</div>{% endif %}
 <div class="kpi"><div class="g"><span>Sous le seuil</span><b>{{d.bas|length}}</b></div><div class="g"><span>Au-dessus</span><b>{{d.nb_bons}}</b></div><div class="g"><span>Analysées</span><b>{{d.n}}</b></div></div>
 {% for c in d.conseils %}<div class="msg">{{c}}</div>{% endfor %}
